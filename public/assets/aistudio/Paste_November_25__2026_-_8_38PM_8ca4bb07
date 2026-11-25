@@ -1,0 +1,1074 @@
+Worked for 2m 21s
+
+### NetFusion — Final Software Implementation Blueprint
+
+We're treating NetFusion as a public cross-platform networking product, not just a personal experiment.
+
+The finalized configuration is:
+
+### NETFUSION
+
+v1.0 project plan
+
+![Início - HaY Systems](https://images.openai.com/static-rsc-4/j-xnKaPzLh-zMCJi3em-1kyyP520YtjwTa5ZN4tkXqqpV03aiqT5qKoWXL5pp6X_QyTd-HXpXNx71gwd0C3lGUyWpi78EHvfRkmd2SXnoCdRd2dC_hffOgUWG3ZzKLUgULA-JWeaBjj3b8RNm55iB6QJHhkA4FONd7D4FMzbrrr4bNuCAgG0-9MABVXhEEA-?purpose=fullsize)
+
+| Configuration       | Final decision           |
+| ------------------- | ------------------------ |
+| Application name    | NetFusion                |
+| Platforms           | Windows + Android        |
+| Interface           | Dark + Light             |
+| Server              | Windows PC               |
+| Server startup      | Automatic with Windows   |
+| Device connectivity | Same local network       |
+| Bonding relay       | Optional                 |
+| Distribution        | Public                   |
+| Main language       | Go                       |
+| Windows UI          | C# / .NET                |
+| Android UI          | Kotlin                   |
+| Streaming           | All major categories     |
+| Network modes       | Load balancing + bonding |
+
+### 1\. Product definition
+
+NetFusion will be a multi-network management application with four main subsystems.
+
+* Network Manager: Detects, monitors and manages multiple internet connections.
+
+* Load Balancer: Distributes different application sessions across available connections.
+
+* Streaming Optimizer: Prioritizes video, live streaming, gaming and video conferencing.
+
+* Bonding Engine: Combines multiple independent network paths through an optional relay.
+
+### Important technical distinction
+
+The optional relay determines which features are possible:
+
+| Feature                                            | Without relay | With relay                              |
+| -------------------------------------------------- | ------------- | --------------------------------------- |
+| Network monitoring                                 | Yes           | Yes                                     |
+| Load balancing                                     | Yes           | Yes                                     |
+| Failover                                           | Yes           | Yes                                     |
+| Streaming prioritization                           | Yes           | Yes                                     |
+| Different downloads on different paths             | Yes           | Yes                                     |
+| Combining one ordinary download across connections | Generally no  | Yes, with supported multipath transport |
+| Combined public internet exit                      | No            | Yes                                     |
+
+The Windows PC will be the local gateway. It will accept connections from Android and Windows clients over the LAN and forward their traffic through the selected upstream connections.
+
+A local server does not itself create additional bandwidth. True bonding requires a compatible endpoint on the other side of the internet paths.
+
+### 2\. Final system architecture
+
+### NetFusion system architecture
+
+Android application
+
+Kotlin • Compose • VPN Service
+
+Windows application
+
+C# • .NET • Dashboard
+
+Central Windows PC
+
+NetFusion Server
+
+Network Manager
+
+Load Balancer
+
+Streaming Engine
+
+Bonding Engine
+
+Jio
+
+Airtel
+
+Wi-Fi
+
+Ethernet
+
+Optional remote bonding relay
+
+Used only for true internet-wide multipath bonding
+
+Internet
+
+### How devices communicate
+
+* Android connects to the Windows server over the local network.
+
+* Windows clients can connect to the same server.
+
+* The server manages the upstream interfaces.
+
+* The routing engine chooses the appropriate connection.
+
+* The optional relay provides the other end of a true bonding tunnel.
+
+Hardware requirement: The PC must have separate access to its client-facing LAN and the independent upstream networks. For example, Ethernet for the LAN, USB tethering for one mobile connection and a separate Wi-Fi adapter for another hotspot.
+
+### 3\. Final technology and dependency versions
+
+These are the recommended baseline versions based on the official release information available on November 24, 2026.
+
+### A. Core development stack
+
+| Technology            | Version         | Purpose               |
+| --------------------- | --------------- | --------------------- |
+| Go                    | 1.27.4          | Server and networking |
+| .NET SDK              | 10.0.404        | Windows application   |
+| .NET runtime          | 10.0.15         | LTS runtime           |
+| C#                    | 14              | Windows development   |
+| Kotlin                | 2.4.21          | Android               |
+| Android Gradle Plugin | 9.4.1           | Android build         |
+| Gradle                | 9.6.0           | Android build         |
+| Node.js               | 26.13.1 LTS     | Dashboard development |
+| TypeScript            | Scaffold-pinned | Dashboard             |
+| React                 | Scaffold-pinned | Dashboard             |
+
+Go 1.27.4 is the current stable release. The Go Programming Language +1
+
+.NET 10 is the recommended choice over .NET 11 for this project because it is the LTS release. Its current servicing version is 10.0.15. .NET +1
+
+Kotlin 2.4.21 and the Android Gradle Plugin versions are documented in the current Kotlin and Android release information. Kotlin Documentation +2
+
+### B. Android dependencies
+
+| Dependency           | Version                                           |
+| -------------------- | ------------------------------------------------- |
+| Compose BOM          | 2026.09.00                                        |
+| Activity Compose     | 1.13.0                                            |
+| Lifecycle            | 2.12.0                                            |
+| AndroidX Core        | 1.19.1                                            |
+| Navigation Compose   | Stable release selected by compatible BOM/tooling |
+| Kotlin Coroutines    | Pin compatible stable release                     |
+| Kotlin Serialization | Match Kotlin plugin version                       |
+
+The Compose BOM version is published in Android's official setup documentation. Android Developers +1
+
+### C. Networking dependencies
+
+| Component                   | Selection                                         |
+| --------------------------- | ------------------------------------------------- |
+| QUIC transport              | quic-go 0.60.0                                    |
+| Windows virtual interface   | Wintun 0.14.1                                     |
+| Windows flow classification | Windows Filtering Platform                        |
+| Android packet interface    | VpnService                                        |
+| Encryption                  | TLS 1.3                                           |
+| Database                    | SQLite                                            |
+| Local API                   | Go net/http                                       |
+| Live dashboard              | Server-Sent Events initially; WebSocket if needed |
+
+Wintun provides a Windows userspace-accessible layer-3 network interface. It does not implement the bonding logic itself. Layer 3 TUN Driver for Windows
+
+Important multipath decision: quic-go 0.60.0 is suitable as a baseline QUIC transport, but do not assume it implements the new Multipath QUIC standard. RFC 10069 was published in November 2026 and defines multipath path management, but leaves traffic scheduling and path discovery to implementations. We must implement or integrate those pieces separately. GitHub +2
+
+For the first bonding prototype, I recommend multiple independent QUIC tunnels managed by our own application-level scheduler. This is easier to test than depending on an unverified multipath library.
+
+### D. Installation resources
+
+* [Install Go](https://go.dev/dl/?utm_source=chatgpt.com)
+
+* [Install .NET 10 SDK](https://dotnet.microsoft.com/en-us/download/dotnet/10.0?utm_source=chatgpt.com)
+
+* [Install Android Studio](https://developer.android.com/studio?utm_source=chatgpt.com)
+
+* [Install Node.js](https://nodejs.org/en/download/?utm_source=chatgpt.com)
+
+* [Wintun documentation](https://www.wintun.net/?utm_source=chatgpt.com)
+
+### 4\. Complete repository structure
+
+The repository should be modular so that the server, Android app and Windows app can be developed independently.
+
+```text
+
+NetFusion/
+│
+├── README.md
+├── LICENSE
+├── .gitignore
+├── .editorconfig
+│
+├── server/
+│   ├── cmd/
+│   │   ├── netfusion-server/
+│   │   │   └── main.go
+│   │   └── netfusion-diagnostics/
+│   │       └── main.go
+│   │
+│   ├── internal/
+│   │   ├── api/
+│   │   ├── auth/
+│   │   ├── config/
+│   │   ├── database/
+│   │   ├── discovery/
+│   │   ├── network/
+│   │   ├── routing/
+│   │   ├── scheduler/
+│   │   ├── streaming/
+│   │   ├── qos/
+│   │   ├── bonding/
+│   │   ├── tunnel/
+│   │   ├── relay/
+│   │   ├── security/
+│   │   ├── clients/
+│   │   ├── metrics/
+│   │   └── logging/
+│   │
+│   ├── configs/
+│   │   ├── server.json
+│   │   ├── streaming.json
+│   │   └── qos.json
+│   │
+│   ├── migrations/
+│   ├── tests/
+│   ├── go.mod
+│   └── go.sum
+│
+├── windows/
+│   ├── NetFusion.sln
+│   ├── NetFusion.App/
+│   │   ├── Views/
+│   │   ├── ViewModels/
+│   │   ├── Models/
+│   │   ├── Services/
+│   │   ├── Networking/
+│   │   ├── Components/
+│   │   └── Resources/
+│   │
+│   ├── NetFusion.Service/
+│   ├── NetFusion.Installer/
+│   └── NetFusion.Tests/
+│
+├── android/
+│   ├── app/
+│   │   └── src/main/
+│   │       ├── java/com/netfusion/
+│   │       │   ├── ui/
+│   │       │   ├── vpn/
+│   │       │   ├── network/
+│   │       │   ├── streaming/
+│   │       │   ├── bonding/
+│   │       │   ├── data/
+│   │       │   └── services/
+│   │       └── AndroidManifest.xml
+│   │
+│   ├── build.gradle.kts
+│   └── settings.gradle.kts
+│
+├── dashboard/
+│   ├── src/
+│   │   ├── components/
+│   │   ├── pages/
+│   │   ├── hooks/
+│   │   ├── services/
+│   │   ├── charts/
+│   │   └── styles/
+│   ├── package.json
+│   └── tsconfig.json
+│
+├── shared/
+│   ├── protocol/
+│   ├── schemas/
+│   ├── models/
+│   └── api/
+│
+├── deployment/
+│   ├── windows/
+│   ├── android/
+│   ├── relay/
+│   └── scripts/
+│
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── API.md
+│   ├── SECURITY.md
+│   ├── PRIVACY.md
+│   ├── INSTALLATION.md
+│   ├── TESTING.md
+│   └── CONTRIBUTING.md
+│
+└── .github/
+    └── workflows/
+        ├── server-build.yml
+        ├── windows-build.yml
+        └── android-build.yml
+```
+
+### 5\. Responsibilities of every major module
+
+| Module    | Responsibility                       |
+| --------- | ------------------------------------ |
+| network   | Detect and monitor interfaces        |
+| discovery | Discover connected NetFusion clients |
+| routing   | Select outgoing network interfaces   |
+| scheduler | Distribute network traffic           |
+| streaming | Classify streaming sessions          |
+| qos       | Manage traffic priorities            |
+| bonding   | Coordinate multiple tunnel paths     |
+| tunnel    | Establish encrypted transport        |
+| relay     | Optional internet-facing endpoint    |
+| auth      | Authenticate devices                 |
+| database  | Store settings and statistics        |
+| metrics   | Provide live network measurements    |
+| logging   | Record system events                 |
+
+Avoid putting everything in `main.go`. It should only initialize services and coordinate application startup.
+
+### 6\. Database design
+
+Use SQLite for local configuration and historical statistics.
+
+Create these tables:
+
+| Table              | Stored information          |
+| ------------------ | --------------------------- |
+| devices            | Paired devices              |
+| interfaces         | Network adapters            |
+| network_metrics    | Speed, latency, jitter      |
+| streaming_profiles | Streaming preferences       |
+| qos_rules          | Traffic priorities          |
+| bonding_sessions   | Tunnel session metadata     |
+| usage_stats        | Data consumption            |
+| app_settings       | User configuration          |
+| system_events      | Connection and error events |
+
+Example configuration:
+
+```json
+
+{
+  "application": {
+    "name": "NetFusion",
+    "version": "0.1.0",
+    "theme": "system"
+  },
+  "server": {
+    "enabled": true,
+    "startup": "windows_boot",
+    "port": 8765,
+    "lan_only": true
+  },
+  "network": {
+    "auto_discovery": true,
+    "monitor_interval_seconds": 3,
+    "automatic_failover": true
+  },
+  "load_balancing": {
+    "enabled": true,
+    "algorithm": "weighted_health"
+  },
+  "streaming": {
+    "enabled": true,
+    "profile": "automatic",
+    "video_priority": 70,
+    "gaming_priority": 90,
+    "realtime_priority": 100
+  },
+  "bonding": {
+    "enabled": false,
+    "relay_mode": "optional"
+  },
+  "security": {
+    "authentication_required": true,
+    "encryption": "TLS 1.3"
+  }
+}
+```
+
+The configuration must not contain private keys, passwords or reusable device tokens in plain text.
+
+### 7\. API design
+
+The Windows server is the central authority for network information and client management.
+
+### Server endpoints
+
+| Method | Endpoint                | Purpose              |
+| ------ | ----------------------- | -------------------- |
+| GET    | /api/health             | Server health        |
+| GET    | /api/interfaces         | Available interfaces |
+| GET    | /api/metrics            | Current measurements |
+| GET    | /api/clients            | Paired devices       |
+| POST   | /api/clients/pair       | Device pairing       |
+| DELETE | /api/clients/{id}       | Revoke pairing       |
+| GET    | /api/streaming/profiles | Streaming profiles   |
+| PUT    | /api/streaming/profile  | Update profile       |
+| GET    | /api/qos/policies       | Traffic rules        |
+| PUT    | /api/qos/policies       | Update traffic rules |
+| GET    | /api/bonding/status     | Bonding state        |
+| GET    | /api/bonding/paths      | Tunnel paths         |
+| GET    | /api/stats/usage        | Usage statistics     |
+
+Use:
+
+* HTTPS for API requests.
+
+* Authenticated Server-Sent Events for live statistics.
+
+* WebSocket only when bidirectional real-time messaging is necessary.
+
+* A separate authenticated transport for tunnel traffic.
+
+Do not expose the administrative API on every network interface by default.
+
+### 8\. Windows server implementation
+
+The server should operate as a Windows service.
+
+![SC（Service Control）、Get-Service、Servy、Winsw、NSSM、AlwaysUp 和 FireDaemon Pro 都是用于在 Windows 操作系统中将普通应用程序作为服务运行的工具。它们各自有不同的功能、特点和使用场景。以下是这些工具的对比表格： - suv789 - 博客园](https://images.openai.com/static-rsc-4/wadorHGB_AhGs1QGdsZ4ly03RtGpdgnUX31Yl4pu4UozgTAqwZ57e2D3Sg_TnqNO418GiKZWaJZJQpN0iXzKy881Xujtcxv8NdhDcLXs7joKeNQsSoCYBJJVCFqt_WXTUZEp5tlhmRNRYpEv1Jc809LAbMVfZ5jEdJE27Scm2-nLvC_jZxh3h6kYKNStq2ux?purpose=fullsize)
+
+### Startup sequence
+
+* Windows starts.
+
+* NetFusion service starts automatically.
+
+* Server loads its configuration.
+
+* It discovers network interfaces.
+
+* It checks which interfaces have internet connectivity.
+
+* It initializes the scheduler.
+
+* It opens the authenticated local API.
+
+* It accepts paired clients.
+
+* It begins monitoring network health.
+
+### Windows components
+
+* Go server executable.
+
+* Windows service wrapper.
+
+* Wintun virtual interface for later VPN routing.
+
+* WFP integration for application-aware traffic handling.
+
+* SQLite database.
+
+* Windows Firewall rules.
+
+* Automatic service recovery.
+
+The service should initially run without changing system routes. Network routing should only be enabled after the user explicitly activates gateway mode.
+
+### Automatic startup configuration
+
+Use a dedicated Windows service installed by the signed installer.
+
+Recommended behavior:
+
+| Setting        | Value                    |
+| -------------- | ------------------------ |
+| Startup type   | Automatic                |
+| Recovery       | Restart on failure       |
+| Server binding | Local LAN, authenticated |
+| Default mode   | Monitoring               |
+| Routing mode   | User-controlled          |
+| Exit behavior  | Restore network state    |
+
+This is safer than running the networking engine as an administrator every time the dashboard opens.
+
+### 9\. Android implementation
+
+![Network Mobile iOS App Design by Purrweb UI/UX Agency on Dribbble](https://images.openai.com/static-rsc-4/aqoh8Tsy2I1invzQ5-mh0otr6qXwQGH1PG8XEk-AKDVVsQwQco2kbYY7iyGXT3t3BlPLpAuDhJ5SkeOA3myk2m8KGVVAWXgBDjnrFtr2laUnguYm2srDjCqeAt-v4OACVK4jJSJZK4JeGPkdxJK0B6FrMWe3wd-gBTmgHYzaUzVQmteHz1G-FY8iqKzmA1-X?purpose=fullsize)
+
+The Android application should include:
+
+* Dashboard.
+
+* Server discovery.
+
+* Secure pairing.
+
+* VPN authorization.
+
+* Application selection.
+
+* Streaming profiles.
+
+* Network statistics.
+
+* Connection settings.
+
+* Emergency disconnect.
+
+### Android permissions and services
+
+The app will need appropriately declared permissions for:
+
+* Internet access.
+
+* Network state.
+
+* Wi-Fi state.
+
+* Foreground VPN operation.
+
+* Notifications where required by Android.
+
+* VPN service authorization.
+
+Use Android's `VpnService` and `ConnectivityManager` APIs.
+
+Important limitations:
+
+* Only one active VPN service can normally operate for a user at a time.
+
+* Android hardware may not support simultaneous use of multiple cellular or Wi-Fi paths.
+
+* VPN traffic must be protected against routing loops.
+
+* Mobile network changes must be handled without unnecessarily interrupting the tunnel.
+
+Public distribution will also require accurate VPN disclosures and compliance with the relevant Google Play policies.
+
+### 10\. Streaming and QoS implementation
+
+The streaming engine should use five traffic categories.
+
+### NetFusion traffic priority model
+
+P0 – Real-time
+
+100/100
+
+Video calls and interactive audio
+
+P1 – Gaming
+
+90/100
+
+Online and cloud gaming
+
+P2 – Video
+
+70/100
+
+YouTube, OTT and video playback
+
+P3 – Normal
+
+50/100
+
+Browsing and general apps
+
+P4 – Background
+
+30/100
+
+Downloads and updates
+
+These are initial scheduling weights, not guaranteed bandwidth percentages.
+
+### Scheduling logic
+
+The scheduler should consider:
+
+* Current available bandwidth.
+
+* Latency.
+
+* Jitter.
+
+* Packet loss.
+
+* Connection stability.
+
+* Traffic category.
+
+* Existing flow assignments.
+
+It should avoid switching an active TCP flow between interfaces unless the routing architecture can preserve that flow.
+
+For encrypted streaming traffic, automatic identification may be uncertain. NetFusion should support manual application selection and user-configured rules.
+
+### 11\. Bonding engine implementation
+
+This is the most important advanced subsystem.
+
+### Recommended approach
+
+Start with multiple independent QUIC tunnels:
+
+```text
+                 Windows Client
+                       |
+                 Bonding Manager
+                       |
+           +-----------+-----------+
+           |           |           |
+        Tunnel 1    Tunnel 2    Tunnel 3
+           |           |           |
+          Jio        Airtel       Wi-Fi
+           |           |           |
+           +-----------+-----------+
+                       |
+                Remote Relay
+                       |
+                    Internet
+```
+
+The bonding manager must handle:
+
+* Tunnel creation.
+
+* Path health.
+
+* Packet scheduling.
+
+* Packet identifiers.
+
+* Reordering.
+
+* Loss recovery.
+
+* Retransmission.
+
+* Flow control.
+
+* Session authentication.
+
+The receiving relay reassembles the data before forwarding it.
+
+Development rule: Do not build a new cryptographic protocol. Use established TLS/QUIC security and concentrate your implementation work on path scheduling, sequencing and recovery.
+
+For the first release, keep this module disabled. The rest of NetFusion should remain fully useful without it.
+
+### 12\. Public distribution requirements
+
+Because NetFusion will be available to other users, we need to design for more than one computer.
+
+This changes some important engineering requirements.
+
+### A. Windows distribution
+
+The Windows installer should include:
+
+* NetFusion desktop application.
+
+* NetFusion Windows service.
+
+* Required networking components.
+
+* Configuration migration.
+
+* Uninstaller.
+
+* Service recovery configuration.
+
+* Version checking.
+
+* Digital signatures.
+
+Recommended installer format: Windows MSI or MSIX, selected according to the service and driver installation requirements.
+
+### B. Android distribution
+
+The Android release should include:
+
+* Signed APK for testing.
+
+* Signed Android App Bundle for Google Play.
+
+* Privacy policy.
+
+* VPN service disclosure.
+
+* Permission explanations.
+
+* Crash reporting controls.
+
+* Update support.
+
+### C. Privacy and security
+
+Public product security requirements
+
+* No collection of browsing history by default.
+
+* No unnecessary storage of destination addresses.
+
+* No transmission of personal network statistics without consent.
+
+* Encrypted device communication.
+
+* Revocable device pairing.
+
+* Protected authentication tokens.
+
+* Local-only server administration by default.
+
+* Transparent data usage and privacy controls.
+
+* Documented vulnerability reporting process.
+
+Also prepare:
+
+* `LICENSE` – software licensing.
+
+* `PRIVACY.md` – privacy practices.
+
+* `TERMS.md` – usage conditions.
+
+* `SECURITY.md` – security reporting.
+
+* `THIRD_PARTY_NOTICES.md` – third-party licenses.
+
+* Software Bill of Materials (SBOM).
+
+Check the licensing of Wintun and every distributed dependency before publishing. Public distribution also requires checking applicable Windows driver redistribution and signing requirements.
+
+### 13\. Complete step-by-step development plan
+
+I recommend developing NetFusion in ten stages.
+
+### Development roadmap
+
+* Stage 1 – Development environment
+
+    Install Go, .NET, Android Studio, Git, Node.js and VS Code.
+
+    Deliverable: All development tools working.
+
+* Stage 2 – Go server
+
+    Implement the HTTP API, service initialization, configuration and database.
+
+    Deliverable: Running Windows server.
+
+* Stage 3 – Network discovery
+
+    Detect interfaces and measure connectivity, latency, jitter and throughput.
+
+    Deliverable: Live network monitoring.
+
+* Stage 4 – Dashboard
+
+    Create dark/light UI, graphs, network cards and settings.
+
+    Deliverable: Working Windows dashboard.
+
+* Stage 5 – Load balancing
+
+    Implement interface-aware sockets, per-flow routing, weighted scheduling and failover.
+
+    Deliverable: Multiple independent network sessions.
+
+* Stage 6 – Streaming engine
+
+    Implement traffic profiles, application selection and QoS.
+
+    Deliverable: Streaming optimization.
+
+* Stage 7 – Android application
+
+    Implement device pairing, network status, VPN service and tunnel client.
+
+    Deliverable: Android client.
+
+* Stage 8 – Windows VPN and gateway
+
+    Implement virtual network adapter, routing, forwarding and firewall integration.
+
+    Deliverable: Full-device traffic routing.
+
+* Stage 9 – True bonding
+
+    Add multiple QUIC paths, remote relay, packet sequencing and reassembly.
+
+    Deliverable: Supported single-flow bandwidth aggregation.
+
+* Stage 10 – Public release
+
+    Testing, signing, privacy documentation, installers and distribution.
+
+    Deliverable: NetFusion public release candidate.
+
+### 14\. Recommended development order by release
+
+| Release | Features                      | Priority  |
+| ------- | ----------------------------- | --------- |
+| 0.1     | Go server + network detection | Essential |
+| 0.2     | Windows dashboard             | Essential |
+| 0.3     | Monitoring + load balancing   | Essential |
+| 0.4     | Streaming and QoS             | Essential |
+| 0.5     | Android client                | Essential |
+| 0.6     | VPN routing and gateway       | Essential |
+| 0.7     | Optional bonding relay        | Advanced  |
+| 0.8     | Multipath aggregation         | Advanced  |
+| 0.9     | Security and public beta      | Essential |
+| 1.0     | Public stable release         | Final     |
+
+My suggestion is to get releases 0.1–0.4 working before beginning VPN development. That gives us a functioning application much earlier.
+
+### 15\. Initial project creation commands
+
+These commands create the initial repository. They do not yet implement VPN routing or internet bonding.
+
+Open PowerShell:
+
+```powershell
+
+# Create the main repository
+mkdir NetFusion
+cd NetFusion
+
+# Create main folders
+mkdir server, windows, android, dashboard
+mkdir shared, docs, deployment
+
+# Server directories
+cd server
+
+mkdir cmd, internal, configs, migrations, tests
+
+mkdir cmd\netfusion-server
+mkdir cmd\netfusion-diagnostics
+
+mkdir internal\api
+mkdir internal\auth
+mkdir internal\config
+mkdir internal\database
+mkdir internal\discovery
+mkdir internal\network
+mkdir internal\routing
+mkdir internal\scheduler
+mkdir internal\streaming
+mkdir internal\qos
+mkdir internal\bonding
+mkdir internal\tunnel
+mkdir internal\relay
+mkdir internal\security
+mkdir internal\clients
+mkdir internal\metrics
+mkdir internal\logging
+
+# Initialize Go module
+go mod init netfusion/server
+
+cd ..
+
+# Initialize Git
+git init
+
+# Open VS Code
+code .
+```
+
+### Install the initial Go packages
+
+From the server folder:
+
+```powershell
+
+cd server
+
+# QUIC transport baseline
+go get github.com/quic-go/quic-go@v0.60.0
+
+# SQLite driver
+go get modernc.org/sqlite
+
+# Clean dependencies
+go mod tidy
+```
+
+Keep the Go standard library for HTTP, networking, JSON, TLS and basic concurrency wherever possible. This reduces dependency maintenance.
+
+### Create the Windows application
+
+```powershell
+dotnet new sln -n NetFusion
+
+dotnet new wpf -n NetFusion.App `
+  -o windows/NetFusion.App `
+  -f net10.0-windows
+
+dotnet sln add windows/NetFusion.App/NetFusion.App.csproj
+```
+
+For the server service, create a separate .NET Worker Service or use a Go-native Windows service host. I prefer a Go-native service host so the networking engine does not need an unnecessary second process for its core operation.
+
+### Create the dashboard
+
+```powershell
+npm create vite@latest dashboard -- --template react-ts
+
+cd dashboard
+npm install
+npm run dev
+```
+
+Use the generated lockfile to pin the actual React, TypeScript and Vite package versions.
+
+### Create the Android project
+
+Open Android Studio:
+
+* Select New Project.
+
+* Choose Empty Activity.
+
+* Set application name to `NetFusion`.
+
+* Set package name to `com.netfusion`.
+
+* Choose Kotlin.
+
+* Enable Jetpack Compose.
+
+* Use a supported Android SDK and compatible Gradle toolchain.
+
+* Add the VPN service only after the basic client and server communication works.
+
+### 16\. Testing requirements
+
+A public networking application needs a proper test strategy.
+
+| Test                        | Expected result                       |
+| --------------------------- | ------------------------------------- |
+| One internet connection     | Normal connectivity                   |
+| Two independent connections | Separate flows use both               |
+| One connection disconnects  | New flows use healthy paths           |
+| High-latency connection     | Scheduler considers latency           |
+| High packet loss            | Unhealthy path is deprioritized       |
+| Video playback              | Stable playback when capacity permits |
+| Video call                  | Prioritized interactive traffic       |
+| Gaming                      | Low-latency path preferred            |
+| Android disconnects         | Tunnel closes cleanly                 |
+| Windows restarts            | Service recovers                      |
+| Relay disconnects           | Bonding disables safely               |
+| App uninstall               | Network configuration restored        |
+
+Also test:
+
+* DNS behavior.
+
+* IPv4 and IPv6.
+
+* DNS leaks.
+
+* IPv6 leaks.
+
+* MTU and fragmentation.
+
+* NAT compatibility.
+
+* Wi-Fi roaming.
+
+* Different mobile carrier networks.
+
+* Multiple clients.
+
+* Concurrent downloads.
+
+* Application crashes.
+
+* Power loss and reboot recovery.
+
+For bonding tests, use a controlled test endpoint and a single large transfer. Verify that multiple paths actually carry portions of that transfer.
+
+### 17\. Important engineering decisions
+
+Before coding the complete product, I want to lock in these five decisions.
+
+1\. Server and clients are separate applications.
+
+The Windows server operates independently of the dashboard. Closing the dashboard should not stop the networking service.
+
+2\. Local mode must work without cloud hosting.
+
+Network monitoring, load balancing, streaming policies and failover should not depend on an external server.
+
+3\. Bonding relay is optional.
+
+The application should clearly indicate when true multipath bonding is unavailable rather than displaying a misleading combined speed.
+
+4\. Network changes must be reversible.
+
+Every routing change must have a recovery mechanism. If NetFusion crashes or is uninstalled, it must restore the original network configuration.
+
+5\. Public distribution requires security from day one.
+
+Device pairing, authentication, encryption, privacy controls and signed releases cannot be postponed until the final release.
+
+One correction to the earlier starter server: its `127.0.0.1` binding is suitable for local development, but Android clients cannot reach it. We will introduce authenticated LAN access after the pairing and firewall components are implemented.
+
+### 18\. Final project acceptance criteria
+
+NetFusion v1.0 will be considered ready when:
+
+* Windows server starts automatically.
+
+* Android and Windows clients can pair securely.
+
+* Multiple independent internet connections are detected.
+
+* Individual network speeds are displayed.
+
+* Load balancing works across separate sessions.
+
+* Automatic failover works.
+
+* Streaming profiles work.
+
+* VPN routing works with user authorization.
+
+* Data usage is monitored.
+
+* Optional relay connectivity works.
+
+* Multipath bonding is verified with controlled tests.
+
+* Windows installer is signed.
+
+* Android release is signed.
+
+* Privacy and licensing documentation is complete.
+
+* Network configuration is safely restored after failures.
+
+### 19\. What we should build first
+
+First development target
+
+### NetFusion v0.1
+
+Windows Network Monitoring Server
+
+![NOC System - Enterprise Network Management by IndoBSD](https://images.openai.com/static-rsc-4/pQnA1T97zL7pbb1lqjO5e4SRcGh3FoAzRLzaGvA4XyXVSNbLbggimultY_v4QVZWwSgl688FqR9l5I534M-V3UGSMdYfl6hVZs81wMNqwilZCZfTZjv5PbUWvXEF0IhW2I9HDrsuN7jY54vX9whKt0PfybqK4LiQ5eVG1TgcG5wB1YeK2BKlBmmaRvBJgoG4?purpose=fullsize)
+
+Initial deliverables:
+
+* Go-based Windows server.
+
+* Automatic network interface detection.
+
+* Jio, Airtel, Wi-Fi and Ethernet monitoring.
+
+* Individual download/upload measurements.
+
+* Latency and packet-loss measurements.
+
+* SQLite configuration storage.
+
+* Basic API.
+
+* Dark/light dashboard.
+
+* Windows service startup.
+
+Success condition: You can see all available internet connections and their live network statistics in one NetFusion dashboard.
+
+My recommendation: Build v0.1 first, then progressively integrate the Windows client, Android client, streaming engine and bonding relay. This is the most practical way to turn NetFusion into a real public software product.
+
+The next implementation task should be creating the complete v0.1 repository and writing the actual Go server, network discovery module, monitoring engine and dashboard—not attempting all the advanced networking features in one step.

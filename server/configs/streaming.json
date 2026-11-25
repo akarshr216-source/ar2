@@ -1,0 +1,45 @@
+{
+  "active_profile": "automatic",
+  "profiles": [
+    {
+      "id": "automatic",
+      "name": "Automatic Balanced",
+      "description": "Prioritizes real-time voice/video calls and low-latency gaming while balancing OTT video and background downloads.",
+      "realtime_priority": 100,
+      "gaming_priority": 90,
+      "video_priority": 70,
+      "normal_priority": 50,
+      "background_priority": 30
+    },
+    {
+      "id": "gaming",
+      "name": "Low-Latency Gaming",
+      "description": "Pins P1 gaming flows to the lowest jitter and lowest RTT healthy interface.",
+      "realtime_priority": 95,
+      "gaming_priority": 100,
+      "video_priority": 60,
+      "normal_priority": 45,
+      "background_priority": 20
+    },
+    {
+      "id": "streaming_4k",
+      "name": "4K Media & Live Stream",
+      "description": "Allocates highest throughput path to P2 video and live broadcast uploads.",
+      "realtime_priority": 95,
+      "gaming_priority": 80,
+      "video_priority": 90,
+      "normal_priority": 50,
+      "background_priority": 25
+    },
+    {
+      "id": "conferencing",
+      "name": "Video Conferencing",
+      "description": "Protects P0 interactive calls against bufferbloat and throttles background transfers.",
+      "realtime_priority": 100,
+      "gaming_priority": 75,
+      "video_priority": 65,
+      "normal_priority": 40,
+      "background_priority": 15
+    }
+  ]
+}

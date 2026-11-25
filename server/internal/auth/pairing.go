@@ -1,0 +1,349 @@
+package auth
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"strings"
+	"time"
+
+	"netfusion/server/internal/database"
+)
+
+var (
+	ErrInvalidCode   = errors.New("invalid pairing code")
+	ErrExpiredCode   = errors.New("pairing code expired")
+	ErrUsedCode      = errors.New("pairing code already used")
+	ErrUnauthorized  = errors.New("unauthorized device token")
+	ErrNotFound      = errors.New("device not found")
+)
+
+type Device struct {
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Platform         string `json:"platform"`
+	DeviceModel      string `json:"device_model"`
+	IPAddress        string `json:"ip_address"`
+	PairingStatus    string `json:"pairing_status"`
+	ConnectionStatus string `json:"connection_status"`
+	AppVersion       string `json:"app_version"`
+	LastSeenAt       string `json:"last_seen_at"`
+	CreatedAt        string `json:"created_at"`
+}
+
+type PairingCodeResult struct {
+	PairingCode  string `json:"pairing_code"`
+	ExpiresAt    string `json:"expires_at"`
+	TTLSeconds   int    `json:"ttl_seconds"`
+	CodeHint     string `json:"code_hint"`
+	PlatformHint string `json:"platform_hint"`
+}
+
+type PairingStatus struct {
+	ActiveCodes        int    `json:"active_codes"`
+	LatestCodeExpires  string `json:"latest_code_expires_at,omitempty"`
+	LatestCodeHint     string `json:"latest_code_hint,omitempty"`
+	RegisteredDevices  int    `json:"registered_devices"`
+	ConnectedDevices   int    `json:"connected_devices"`
+	DisconnectedCount  int    `json:"disconnected_devices"`
+	HeartbeatTimeoutS  int    `json:"heartbeat_timeout_seconds"`
+}
+
+type PairingService struct {
+	store             *database.Store
+	heartbeatTimeoutS int
+}
+
+func NewPairingService(store *database.Store, heartbeatTimeoutSeconds int) *PairingService {
+	if heartbeatTimeoutSeconds < 5 {
+		heartbeatTimeoutSeconds = 15
+	}
+	return &PairingService{
+		store:             store,
+		heartbeatTimeoutS: heartbeatTimeoutSeconds,
+	}
+}
+
+func normalizeCode(raw string) string {
+	var b strings.Builder
+	for _, r := range strings.ToUpper(raw) {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func hashSHA256(val string) string {
+	sum := sha256.Sum256([]byte(val))
+	return hex.EncodeToString(sum[:])
+}
+
+func randomHex(nBytes int) (string, error) {
+	buf := make([]byte, nBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func (p *PairingService) GeneratePairingCode(ttlSeconds int, platformHint string) (*PairingCodeResult, error) {
+	if ttlSeconds < 30 || ttlSeconds > 900 {
+		ttlSeconds = 300
+	}
+	if platformHint != "android" && platformHint != "windows" {
+		platformHint = "any"
+	}
+
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return nil, err
+	}
+	raw := make([]byte, 8)
+	for i := range buf {
+		raw[i] = alphabet[int(buf[i])%len(alphabet)]
+	}
+	formatted := "NF-" + string(raw[:4]) + "-" + string(raw[4:])
+	hint := "NF-****-**" + string(raw[6:])
+	codeHash := hashSHA256(normalizeCode(formatted))
+
+	idHex, err := randomHex(6)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	expiresAt := now.Add(time.Duration(ttlSeconds) * time.Second)
+
+	_, err = p.store.DB.Exec(
+		`INSERT INTO pairing_codes (id, code_hash, code_hint, platform_hint, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		"pc-"+idHex, codeHash, hint, platformHint, expiresAt.Format(time.RFC3339), now.Format(time.RFC3339),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PairingCodeResult{
+		PairingCode:  formatted,
+		ExpiresAt:    expiresAt.Format(time.RFC3339),
+		TTLSeconds:   ttlSeconds,
+		CodeHint:     hint,
+		PlatformHint: platformHint,
+	}, nil
+}
+
+func (p *PairingService) PairWithCode(code, deviceName, platform, deviceModel, ipAddress, appVersion string) (*Device, string, error) {
+	norm := normalizeCode(code)
+	if len(norm) < 6 {
+		return nil, "", ErrInvalidCode
+	}
+	codeHash := hashSHA256(norm)
+	now := time.Now().UTC()
+	nowStr := now.Format(time.RFC3339)
+
+	tx, err := p.store.DB.Begin()
+	if err != nil {
+		return nil, "", err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var codeID, platformHint, expiresAtStr string
+	var usedAt sql.NullString
+	err = tx.QueryRow(
+		`SELECT id, platform_hint, expires_at, used_at FROM pairing_codes WHERE code_hash = ?`,
+		codeHash,
+	).Scan(&codeID, &platformHint, &expiresAtStr, &usedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, "", ErrInvalidCode
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	if usedAt.Valid {
+		return nil, "", ErrUsedCode
+	}
+	expiresAt, err := time.Parse(time.RFC3339, expiresAtStr)
+	if err != nil || !expiresAt.After(now) {
+		return nil, "", ErrExpiredCode
+	}
+	if platformHint != "any" && platformHint != platform {
+		return nil, "", ErrInvalidCode
+	}
+
+	devHex, err := randomHex(6)
+	if err != nil {
+		return nil, "", err
+	}
+	tokHex, err := randomHex(24)
+	if err != nil {
+		return nil, "", err
+	}
+	deviceID := "dev-" + devHex
+	authToken := "nf_dev_" + tokHex
+	tokenHash := hashSHA256(authToken)
+
+	res, err := tx.Exec(
+		`UPDATE pairing_codes SET used_at = ?, used_by_device_id = ? WHERE id = ? AND used_at IS NULL`,
+		nowStr, deviceID, codeID,
+	)
+	if err != nil {
+		return nil, "", err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return nil, "", ErrUsedCode
+	}
+
+	_, err = tx.Exec(
+		`INSERT INTO devices (id, name, platform, device_model, ip_address, token_hash, pairing_status, connection_status, app_version, status, last_seen_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, 'paired', 'connected', ?, 'paired', ?, ?)`,
+		deviceID, deviceName, platform, deviceModel, ipAddress, tokenHash, appVersion, nowStr, nowStr,
+	)
+	if err != nil {
+		return nil, "", err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, "", err
+	}
+
+	return &Device{
+		ID:               deviceID,
+		Name:             deviceName,
+		Platform:         platform,
+		DeviceModel:      deviceModel,
+		IPAddress:        ipAddress,
+		PairingStatus:    "paired",
+		ConnectionStatus: "connected",
+		AppVersion:       appVersion,
+		LastSeenAt:       nowStr,
+		CreatedAt:        nowStr,
+	}, authToken, nil
+}
+
+func (p *PairingService) RecordHeartbeat(bearerToken, ipAddress, appVersion, deviceModel string) (*Device, error) {
+	if !strings.HasPrefix(bearerToken, "nf_dev_") {
+		return nil, ErrUnauthorized
+	}
+	tokenHash := hashSHA256(bearerToken)
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+
+	var dev Device
+	err := p.store.DB.QueryRow(
+		`SELECT id, name, platform, device_model, ip_address, pairing_status, connection_status, app_version, last_seen_at, created_at
+		 FROM devices WHERE token_hash = ? AND pairing_status = 'paired'`,
+		tokenHash,
+	).Scan(&dev.ID, &dev.Name, &dev.Platform, &dev.DeviceModel, &dev.IPAddress, &dev.PairingStatus, &dev.ConnectionStatus, &dev.AppVersion, &dev.LastSeenAt, &dev.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrUnauthorized
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if ipAddress != "" {
+		dev.IPAddress = ipAddress
+	}
+	if appVersion != "" {
+		dev.AppVersion = appVersion
+	}
+	if deviceModel != "" {
+		dev.DeviceModel = deviceModel
+	}
+	dev.ConnectionStatus = "connected"
+	dev.LastSeenAt = nowStr
+
+	_, err = p.store.DB.Exec(
+		`UPDATE devices SET connection_status = 'connected', last_seen_at = ?, ip_address = ?, app_version = ?, device_model = ? WHERE id = ?`,
+		nowStr, dev.IPAddress, dev.AppVersion, dev.DeviceModel, dev.ID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &dev, nil
+}
+
+func (p *PairingService) EvaluateTimeouts() error {
+	cutoff := time.Now().UTC().Add(-time.Duration(p.heartbeatTimeoutS) * time.Second).Format(time.RFC3339)
+	_, err := p.store.DB.Exec(
+		`UPDATE devices SET connection_status = 'disconnected' WHERE pairing_status = 'paired' AND connection_status = 'connected' AND last_seen_at < ?`,
+		cutoff,
+	)
+	return err
+}
+
+func (p *PairingService) ListDevices() ([]Device, error) {
+	_ = p.EvaluateTimeouts()
+	rows, err := p.store.DB.Query(
+		`SELECT id, name, platform, device_model, ip_address, pairing_status, connection_status, app_version, last_seen_at, created_at
+		 FROM devices ORDER BY CASE WHEN connection_status = 'connected' THEN 0 ELSE 1 END, last_seen_at DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	devices := make([]Device, 0)
+	for rows.Next() {
+		var d Device
+		if err := rows.Scan(&d.ID, &d.Name, &d.Platform, &d.DeviceModel, &d.IPAddress, &d.PairingStatus, &d.ConnectionStatus, &d.AppVersion, &d.LastSeenAt, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		devices = append(devices, d)
+	}
+	return devices, nil
+}
+
+func (p *PairingService) RevokeDevice(id string) error {
+	res, err := p.store.DB.Exec(`DELETE FROM devices WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *PairingService) Status() (*PairingStatus, error) {
+	_ = p.EvaluateTimeouts()
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+
+	var activeCodes int
+	_ = p.store.DB.QueryRow(`SELECT COUNT(*) FROM pairing_codes WHERE used_at IS NULL AND expires_at > ?`, nowStr).Scan(&activeCodes)
+
+	var hint, expires sql.NullString
+	_ = p.store.DB.QueryRow(
+		`SELECT code_hint, expires_at FROM pairing_codes WHERE used_at IS NULL AND expires_at > ? ORDER BY created_at DESC LIMIT 1`,
+		nowStr,
+	).Scan(&hint, &expires)
+
+	var total, connected, disconnected int
+	_ = p.store.DB.QueryRow(
+		`SELECT COUNT(*), COALESCE(SUM(CASE WHEN connection_status='connected' THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN connection_status='disconnected' THEN 1 ELSE 0 END),0)
+		 FROM devices WHERE pairing_status = 'paired'`,
+	).Scan(&total, &connected, &disconnected)
+
+	return &PairingStatus{
+		ActiveCodes:       activeCodes,
+		LatestCodeExpires: expires.String,
+		LatestCodeHint:    hint.String,
+		RegisteredDevices: total,
+		ConnectedDevices:  connected,
+		DisconnectedCount: disconnected,
+		HeartbeatTimeoutS: p.heartbeatTimeoutS,
+	}, nil
+}
+
+func ConstantTimeAdminMatch(provided, expected string) bool {
+	if expected == "" || provided == "" {
+		return false
+	}
+	a := sha256.Sum256([]byte(provided))
+	b := sha256.Sum256([]byte(expected))
+	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
+}

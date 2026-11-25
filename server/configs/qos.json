@@ -1,0 +1,9 @@
+{
+  "priority_tiers": [
+    { "tier": "P0", "name": "Real-time", "weight": 100, "examples": "Video calls, VoIP, interactive audio" },
+    { "tier": "P1", "name": "Gaming", "weight": 90, "examples": "Online multiplayer, cloud gaming" },
+    { "tier": "P2", "name": "Video", "weight": 70, "examples": "YouTube, OTT playback, live streaming" },
+    { "tier": "P3", "name": "Normal", "weight": 50, "examples": "Web browsing, productivity apps" },
+    { "tier": "P4", "name": "Background", "weight": 30, "examples": "OS updates, bulk downloads, backups" }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "NetFusion",
+  "description": "Cross-platform multi-network monitoring, load balancing, and streaming QoS control plane.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
