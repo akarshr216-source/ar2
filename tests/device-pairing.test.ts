@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import express from 'express';
 import fs from 'node:fs';
 import type http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { createNetFusionApp, isLocalOrLanAddress, type NetFusionAppInstance } from '../server-runtime/app.ts';
+import { createApiReverseProxy } from '../server-runtime/proxy.ts';
 
 function startListening(instance: NetFusionAppInstance): Promise<{ server: http.Server; baseUrl: string }> {
   return new Promise((resolve) => {
@@ -107,6 +109,65 @@ describe('NetFusion QR pairing, real device registry, and zero-mock networking',
     assert.equal(parsed.searchParams.get('secret'), body.secret);
     assert.equal(parsed.searchParams.get('auth_token'), null);
     assert.equal(parsed.searchParams.get('token'), null);
+
+    // Reject localhost / 127.0.0.1 / 0.0.0.0 / non-HTTPS remote URLs in QR generation
+    for (const badServerUrl of [
+      'http://localhost:3000',
+      'http://127.0.0.1:8080',
+      'http://0.0.0.0:8080',
+      'http://203.0.113.10:8080',
+    ]) {
+      const badRes = await fetch(`${baseUrl}/api/pairing/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({
+          platform_hint: 'android',
+          server_url: badServerUrl,
+        }),
+      });
+      assert.equal(badRes.status, 400, `expected 400 for ${badServerUrl}`);
+    }
+
+    // Verify /api/health returns ranked LAN addresses (no 127.0.0.1) and honors NETFUSION_PUBLIC_URL
+    const prevPublicUrl = process.env.NETFUSION_PUBLIC_URL;
+    process.env.NETFUSION_PUBLIC_URL = 'http://192.168.1.16:8080';
+    try {
+      const healthRes = await fetch(`${baseUrl}/api/health`);
+      assert.equal(healthRes.status, 200);
+      const healthBody = (await healthRes.json()) as {
+        public_url: string | null;
+        lan_addresses: string[];
+        backend_mode: string;
+      };
+      assert.equal(healthBody.backend_mode, 'node');
+      assert.equal(healthBody.public_url, 'http://192.168.1.16:8080');
+      assert.ok(!healthBody.lan_addresses.includes('127.0.0.1'));
+
+      const defaultQrRes = await fetch(`${baseUrl}/api/pairing/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({ platform_hint: 'android' }),
+      });
+      assert.equal(defaultQrRes.status, 201);
+      const defaultQrBody = (await defaultQrRes.json()) as { server_url: string; qr_payload: string };
+      assert.equal(defaultQrBody.server_url, 'http://192.168.1.16:8080');
+      assert.equal(
+        new URL(defaultQrBody.qr_payload).searchParams.get('server'),
+        'http://192.168.1.16:8080',
+      );
+    } finally {
+      if (prevPublicUrl === undefined) {
+        delete process.env.NETFUSION_PUBLIC_URL;
+      } else {
+        process.env.NETFUSION_PUBLIC_URL = prevPublicUrl;
+      }
+    }
   });
 
   it('3 & 4. rejects invalid and expired QR pairing sessions', async () => {
@@ -389,6 +450,60 @@ describe('NetFusion QR pairing, real device registry, and zero-mock networking',
       await new Promise<void>((resolve) => rlServer.server.close(() => resolve()));
       rlInstance.close();
       fs.rmSync(rlDir, { recursive: true, force: true });
+    }
+  });
+
+  it('9. proxies /api/* transparently to upstream API server and returns 502 when offline', async () => {
+    const proxyApp = express();
+    proxyApp.use('/api', createApiReverseProxy(baseUrl));
+    const proxyServer = await new Promise<http.Server>((resolve) => {
+      const s = proxyApp.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const addr = proxyServer.address();
+    assert.ok(addr && typeof addr !== 'string');
+    const proxyUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      const healthRes = await fetch(`${proxyUrl}/api/health`);
+      assert.equal(healthRes.status, 200);
+      const healthBody = (await healthRes.json()) as { application: string };
+      assert.equal(healthBody.application, 'NetFusion');
+
+      const genRes = await fetch(`${proxyUrl}/api/pairing/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({
+          platform_hint: 'android',
+          server_url: 'http://192.168.1.16:8080',
+        }),
+      });
+      assert.equal(genRes.status, 201);
+      const genBody = (await genRes.json()) as { server_url: string; qr_payload: string };
+      assert.equal(genBody.server_url, 'http://192.168.1.16:8080');
+      assert.ok(genBody.qr_payload.includes('192.168.1.16'));
+    } finally {
+      await new Promise<void>((resolve) => proxyServer.close(() => resolve()));
+    }
+
+    // Verify offline upstream returns clean 502 JSON instead of crashing
+    const deadProxyApp = express();
+    deadProxyApp.use('/api', createApiReverseProxy('http://127.0.0.1:1'));
+    const deadProxyServer = await new Promise<http.Server>((resolve) => {
+      const s = deadProxyApp.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const deadAddr = deadProxyServer.address();
+    assert.ok(deadAddr && typeof deadAddr !== 'string');
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${deadAddr.port}/api/health`);
+      assert.equal(res.status, 502);
+      const body = (await res.json()) as { error: string };
+      assert.match(body.error, /offline or unreachable/i);
+    } finally {
+      await new Promise<void>((resolve) => deadProxyServer.close(() => resolve()));
     }
   });
 });

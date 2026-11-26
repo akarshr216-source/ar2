@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"net"
+	"sync"
 	"time"
 
 	"netfusion/server/internal/metrics"
@@ -11,10 +12,15 @@ import (
 type Monitor struct {
 	discoverer *Discoverer
 	collector  *metrics.Collector
+	mu         sync.RWMutex
 	interval   time.Duration
+	onCycle    func()
 }
 
 func NewMonitor(d *Discoverer, c *metrics.Collector, interval time.Duration) *Monitor {
+	if interval <= 0 {
+		interval = 3 * time.Second
+	}
 	return &Monitor{
 		discoverer: d,
 		collector:  c,
@@ -22,19 +28,53 @@ func NewMonitor(d *Discoverer, c *metrics.Collector, interval time.Duration) *Mo
 	}
 }
 
-func (m *Monitor) Start(ctx context.Context) {
-	ticker := time.NewTicker(m.interval)
-	defer ticker.Stop()
+func (m *Monitor) SetOnCycle(fn func()) {
+	m.mu.Lock()
+	m.onCycle = fn
+	m.mu.Unlock()
+}
 
+func (m *Monitor) SetInterval(interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	m.mu.Lock()
+	m.interval = interval
+	m.mu.Unlock()
+}
+
+func (m *Monitor) Start(ctx context.Context) {
 	m.probeOnce()
 	for {
+		m.mu.RLock()
+		d := m.interval
+		m.mu.RUnlock()
+
+		timer := time.NewTimer(d)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			m.probeOnce()
 		}
 	}
+}
+
+func (m *Monitor) ProbeNow() (*float64, *float64) {
+	cf := measureTCP("1.1.1.1:443")
+	gg := measureTCP("8.8.8.8:443")
+	var cfPtr, ggPtr *float64
+	if cf >= 0 {
+		v := cf
+		cfPtr = &v
+	}
+	if gg >= 0 {
+		v := gg
+		ggPtr = &v
+	}
+	m.probeOnce()
+	return cfPtr, ggPtr
 }
 
 func (m *Monitor) probeOnce() {
@@ -62,6 +102,13 @@ func (m *Monitor) probeOnce() {
 			PacketLossPct: loss,
 			RecordedAt:    time.Now().UTC(),
 		})
+	}
+
+	m.mu.RLock()
+	cb := m.onCycle
+	m.mu.RUnlock()
+	if cb != nil {
+		cb()
 	}
 }
 

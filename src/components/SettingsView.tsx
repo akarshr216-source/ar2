@@ -5,6 +5,8 @@ interface SettingsViewProps {
   settings: NetFusionSettings;
   events: SystemEvent[];
   apiBaseUrl: string;
+  publicUrl: string | null;
+  backendMode: 'go' | 'node' | null;
   onChangeApiBaseUrl: (url: string) => void;
   onUpdateSettings: (patch: Partial<NetFusionSettings>) => void;
 }
@@ -32,6 +34,8 @@ export function SettingsView({
   settings,
   events,
   apiBaseUrl,
+  publicUrl,
+  backendMode,
   onChangeApiBaseUrl,
   onUpdateSettings,
 }: SettingsViewProps) {
@@ -40,13 +44,18 @@ export function SettingsView({
   return (
     <div className="space-y-6">
       <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 space-y-5">
-        <div>
-          <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-            NetFusion Settings
-          </h2>
-          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-            Settings are saved automatically in the local database.
-          </p>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+              NetFusion Settings
+            </h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              Settings are saved automatically in the local database.
+            </p>
+          </div>
+          <div className="text-xs font-mono text-slate-600 dark:text-slate-300 bg-slate-50 dark:bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800">
+            API: {backendMode === 'go' ? 'Go Server' : 'Node Server'} · QR Target: {publicUrl ?? 'Not Configured'}
+          </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">

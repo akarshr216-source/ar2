@@ -3,7 +3,7 @@
 ## Public / Monitoring Endpoints
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
-| GET | `/api/health` | Server health, configured port, and detected LAN IPv4 addresses |
+| GET | `/api/health` | Server health, `backend_mode` (`go` or `node`), `public_url`, configured port, and ranked LAN IPv4 addresses |
 | GET | `/api/interfaces` | Real host network adapters detected from the operating system |
 | GET | `/api/metrics` | Latest real traffic totals, internet reachability, latency, and adapter metrics (`null` / `Unavailable` if unavailable) |
 | POST | `/api/network/check` | Run an immediate TCP reachability check (`1.1.1.1:443` / `8.8.8.8:443`) and refresh snapshot |
@@ -19,7 +19,7 @@ Restricted to local/LAN addresses when `lan_only=true` (`403` for public interne
 | POST | `/api/admin/claim` | Set initial administrator password (when `NETFUSION_ADMIN_PASSCODE` is unset) |
 | POST | `/api/admin/login` | Sign in with administrator password (`429` after 5 failures in 5 minutes) |
 | POST | `/api/admin/logout` | Sign out current administrator session |
-| POST | `/api/pairing/generate` | Create a single-use 2-minute (`120s`) pairing session returning `pairing_id`, `secret`, `qr_payload` (`netfusion://pair?...`), and `expires_at` (never contains `auth_token`) |
+| POST | `/api/pairing/generate` | Create a single-use 2-minute (`120s`) pairing session returning `pairing_id`, `secret`, `server_url`, `qr_payload` (`netfusion://pair?...`), and `expires_at` (rejects `localhost`/`127.0.0.1` with `400`; never contains `auth_token`) |
 | GET | `/api/pairing/status` | Active QR pairing status and connected/disconnected device counts |
 | GET | `/api/clients` | List all real paired devices with live `connection_status` and traffic counters |
 | DELETE | `/api/clients/{id}` | Unpair a device and immediately revoke its `auth_token` |

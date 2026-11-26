@@ -18,6 +18,8 @@ export default function App() {
     apiBaseUrl,
     setApiBaseUrl,
     lanAddresses,
+    publicUrl,
+    backendMode,
     snapshot,
     clients,
     clientsLoading,
@@ -95,6 +97,8 @@ export default function App() {
                 <DashboardView
                   snapshot={snapshot}
                   lanAddresses={lanAddresses}
+                  publicUrl={publicUrl}
+                  backendMode={backendMode}
                   clients={clients}
                   isAdminAuthenticated={isAdminAuthenticated}
                   checkingNetwork={checkingNetwork}
@@ -137,6 +141,8 @@ export default function App() {
                   settings={snapshot.settings}
                   events={snapshot.events}
                   apiBaseUrl={apiBaseUrl}
+                  publicUrl={publicUrl}
+                  backendMode={backendMode}
                   onChangeApiBaseUrl={setApiBaseUrl}
                   onUpdateSettings={(patch) => void updateSettings(patch)}
                 />
@@ -150,6 +156,7 @@ export default function App() {
         open={addDeviceOpen}
         onClose={() => setAddDeviceOpen(false)}
         apiBaseUrl={apiBaseUrl}
+        publicUrl={publicUrl}
         serverPort={snapshot?.settings.server_port ?? 8080}
         lanAddresses={lanAddresses}
         adminAuthStatus={adminAuthStatus}

@@ -59,7 +59,7 @@ export function NetworksView({
                 ? `Online · ${internetLatencyMs.toFixed(1)} ms`
                 : internetStatus === 'offline'
                   ? 'Offline'
-                  : 'Unavailable'}
+                  : 'Not Configured'}
             </div>
           </div>
 
@@ -92,7 +92,7 @@ export function NetworksView({
               {interfaces.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="py-10 text-center text-sm text-slate-500 dark:text-slate-400">
-                    No active network interfaces detected on this host.
+                    Not Configured — no active network interfaces detected on this host.
                   </td>
                 </tr>
               ) : (

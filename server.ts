@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'node:path';
 import { createNetFusionApp } from './server-runtime/app.ts';
+import { createApiReverseProxy } from './server-runtime/proxy.ts';
 
 function parseCliFlags(): { host?: string; port?: number } {
   const args = process.argv.slice(2);
@@ -25,44 +26,75 @@ function parseCliFlags(): { host?: string; port?: number } {
   return { host, port };
 }
 
-function parseEnvHostBind(): { host?: string; port?: number } {
-  const raw = (process.env.NETFUSION_HOST_BIND || '').trim();
-  if (!raw) return {};
-  const idx = raw.lastIndexOf(':');
-  if (idx > 0 && idx < raw.length - 1) {
-    const host = raw.slice(0, idx) || undefined;
-    const port = Number(raw.slice(idx + 1));
-    return { host, port: Number.isFinite(port) && port > 0 ? port : undefined };
-  }
-  return { host: raw };
-}
-
-function resolveListenTarget(): { host: string; port: number } {
+function resolveDashboardListenTarget(): { host: string; port: number } {
   const cli = parseCliFlags();
-  const envBind = parseEnvHostBind();
-
   let port = 3000;
   if (cli.port) {
     port = cli.port;
   } else if (process.env.DEFAULT_APP_PORT) {
     const p = Number(process.env.DEFAULT_APP_PORT);
     if (Number.isFinite(p) && p > 0) port = p;
-  } else if (envBind.port) {
-    port = envBind.port;
   } else if (process.env.PORT && process.env.PORT !== process.env.NGINX_PORT) {
     const p = Number(process.env.PORT);
     if (Number.isFinite(p) && p > 0) port = p;
   }
-
-  const host = cli.host || (process.env.DEFAULT_APP_PORT ? '0.0.0.0' : envBind.host || '0.0.0.0');
+  const host = cli.host || '0.0.0.0';
   return { host, port };
 }
 
-async function startServer() {
-  const { host, port } = resolveListenTarget();
-  const workspaceRoot = path.resolve(process.cwd());
+async function detectGoBackendOnPort(targetUrl: string): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 800);
+    const res = await fetch(`${targetUrl}/api/health`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return false;
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) return false;
+    const body = (await res.json()) as { application?: string; backend_mode?: string };
+    return body.application === 'NetFusion' && body.backend_mode === 'go';
+  } catch {
+    return false;
+  }
+}
 
-  const { app } = createNetFusionApp();
+async function resolveApiProxyTarget(): Promise<string | null> {
+  const explicit = (process.env.NETFUSION_API_PROXY_TARGET || '').trim().replace(/\/+$/, '');
+  if (explicit === 'none' || explicit === 'off') {
+    return null;
+  }
+  if (explicit) {
+    const parsed = new URL(explicit);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error('NETFUSION_API_PROXY_TARGET must use http:// or https://');
+    }
+    return parsed.origin;
+  }
+  // When running outside the AI Studio preview proxy, automatically prefer the Go API server on :8080 if reachable
+  if (!process.env.DEFAULT_APP_PORT) {
+    const localGo = 'http://127.0.0.1:8080';
+    if (await detectGoBackendOnPort(localGo)) {
+      return localGo;
+    }
+  }
+  return null;
+}
+
+async function startServer() {
+  const { host, port } = resolveDashboardListenTarget();
+  const workspaceRoot = path.resolve(process.cwd());
+  const proxyTarget = await resolveApiProxyTarget();
+
+  let app: express.Express;
+  if (proxyTarget) {
+    app = express();
+    const proxyMiddleware = createApiReverseProxy(proxyTarget);
+    app.use('/api', proxyMiddleware);
+    console.log(`NetFusion dashboard proxying /api/* to Go server at ${proxyTarget}`);
+  } else {
+    const instance = createNetFusionApp();
+    app = instance.app;
+  }
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -79,18 +111,8 @@ async function startServer() {
     });
   }
 
-  const srv = app.listen(port, host, () => {
-    console.log(`NetFusion control plane listening on http://${host}:${port}`);
-  });
-  srv.on('error', (err: NodeJS.ErrnoException) => {
-    if (err.code === 'EADDRNOTAVAIL' && host !== '0.0.0.0') {
-      console.warn(`Bind address ${host} is unavailable here; falling back to 0.0.0.0:${port}`);
-      app.listen(port, '0.0.0.0', () => {
-        console.log(`NetFusion control plane listening on http://0.0.0.0:${port}`);
-      });
-      return;
-    }
-    throw err;
+  app.listen(port, host, () => {
+    console.log(`NetFusion dashboard listening on http://${host}:${port}`);
   });
 }
 

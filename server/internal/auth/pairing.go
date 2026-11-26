@@ -46,6 +46,7 @@ type PairingCodeResult struct {
 	TTLSeconds   int      `json:"ttl_seconds"`
 	CodeHint     string   `json:"code_hint"`
 	PlatformHint string   `json:"platform_hint"`
+	ServerURL    string   `json:"server_url,omitempty"`
 	LanAddresses []string `json:"lan_addresses,omitempty"`
 	QrPayload    string   `json:"qr_payload,omitempty"`
 }

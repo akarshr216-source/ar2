@@ -4,6 +4,8 @@ import type { PairedDevice, TelemetrySnapshot } from '../types/netfusion';
 interface DashboardViewProps {
   snapshot: TelemetrySnapshot;
   lanAddresses: string[];
+  publicUrl: string | null;
+  backendMode: 'go' | 'node' | null;
   clients: PairedDevice[];
   isAdminAuthenticated: boolean;
   checkingNetwork: boolean;
@@ -14,7 +16,7 @@ interface DashboardViewProps {
 }
 
 function formatBytes(bytes: number | null): string {
-  if (bytes === null) return 'Unavailable';
+  if (bytes === null) return 'Not Configured';
   if (bytes < 1024) return `${bytes} B`;
   const kb = bytes / 1024;
   if (kb < 1024) return `${kb.toFixed(1)} KB`;
@@ -33,6 +35,8 @@ function formatBpsRate(bps: number | null): string {
 export function DashboardView({
   snapshot,
   lanAddresses,
+  publicUrl,
+  backendMode,
   clients,
   isAdminAuthenticated,
   checkingNetwork,
@@ -41,15 +45,16 @@ export function DashboardView({
   onOpenSettings,
   onCheckNetwork,
 }: DashboardViewProps) {
-  const lanIpDisplay =
-    lanAddresses.find((ip) => ip !== '127.0.0.1') ?? 'Localhost only';
+  const firstLanIp = lanAddresses.find((ip) => ip !== '127.0.0.1' && !ip.startsWith('127.'));
+  const selectedServerAddress =
+    publicUrl || (firstLanIp ? `http://${firstLanIp}:${snapshot.settings.server_port}` : null);
 
   const internetLabel =
     snapshot.internet_status === 'online'
       ? 'Online'
       : snapshot.internet_status === 'offline'
         ? 'Offline'
-        : 'Unavailable';
+        : 'Not Configured';
 
   const internetCls =
     snapshot.internet_status === 'online'
@@ -67,13 +72,13 @@ export function DashboardView({
       <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
         <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 flex flex-col justify-between gap-2">
           <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
-            Server Status
+            Server Status {backendMode === 'go' ? '(Go API)' : ''}
           </div>
           <div className="text-2xl font-bold text-emerald-700 dark:text-emerald-400">
             Running
           </div>
           <div className="text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400 truncate">
-            {lanIpDisplay} · Port {snapshot.settings.server_port}
+            {selectedServerAddress ?? 'Not Configured'}
           </div>
         </div>
 

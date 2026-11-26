@@ -1,26 +1,26 @@
 {
   "application": {
     "name": "NetFusion",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "theme": "system"
   },
   "server": {
     "enabled": true,
     "startup": "windows_boot",
-    "port": 8765,
+    "port": 8080,
     "lan_only": true
   },
   "network": {
     "auto_discovery": true,
     "monitor_interval_seconds": 3,
-    "automatic_failover": true
+    "automatic_failover": false
   },
   "load_balancing": {
-    "enabled": true,
+    "enabled": false,
     "algorithm": "weighted_health"
   },
   "streaming": {
-    "enabled": true,
+    "enabled": false,
     "profile": "automatic",
     "video_priority": 70,
     "gaming_priority": 90,

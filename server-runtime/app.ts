@@ -6,18 +6,130 @@ import { NetFusionStore } from './db.ts';
 import { NetworkMonitor } from './network-monitor.ts';
 import type { DevicePlatform, NetFusionSettings } from './types.ts';
 
-function getLanIPv4Addresses(): string[] {
+const VIRTUAL_ADAPTER_PATTERN =
+  /(vethernet|hyper-v|wsl|docker|vmware|virtualbox|vbox|tailscale|zerotier|hamachi|bluetooth|loopback|isatap|teredo|tun|tap)/i;
+
+function scoreLanCandidate(ifaceName: string, ip: string): number {
+  const parts = ip.split('.').map(Number);
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+    return -1000;
+  }
+  const [a, b] = parts;
+  if (a === 127 || a === 0) return -1000;
+
+  let score = 0;
+  if (a === 192 && b === 168) {
+    score += 100;
+  } else if (a === 10) {
+    score += 80;
+  } else if (a === 172 && b >= 16 && b <= 31) {
+    score += 60;
+  } else if (a === 169 && b === 254) {
+    // APIPA/link-local: deprioritize behind real RFC1918 LAN addresses
+    score -= 50;
+  } else {
+    score += 20;
+  }
+
+  const lower = ifaceName.toLowerCase();
+  if (lower.includes('wi-fi') || lower.includes('wifi') || lower.includes('wlan')) {
+    score += 25;
+  } else if (lower.includes('ethernet') || lower.startsWith('eth') || lower.startsWith('en')) {
+    score += 15;
+  }
+  if (VIRTUAL_ADAPTER_PATTERN.test(ifaceName)) {
+    score -= 80;
+  }
+  return score;
+}
+
+export function getLanIPv4Addresses(): string[] {
   const nets = os.networkInterfaces();
-  const ips: string[] = [];
-  for (const addrs of Object.values(nets)) {
+  const candidates: Array<{ ip: string; score: number }> = [];
+  for (const [ifaceName, addrs] of Object.entries(nets)) {
     if (!addrs) continue;
     for (const addr of addrs) {
-      if (addr.family === 'IPv4' && !addr.internal) {
-        ips.push(addr.address);
+      if (addr.family === 'IPv4' && !addr.internal && addr.address !== '127.0.0.1') {
+        candidates.push({
+          ip: addr.address,
+          score: scoreLanCandidate(ifaceName, addr.address),
+        });
       }
     }
   }
-  return ips;
+  candidates.sort((a, b) => b.score - a.score);
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const c of candidates) {
+    if (!seen.has(c.ip)) {
+      seen.add(c.ip);
+      ordered.push(c.ip);
+    }
+  }
+  return ordered;
+}
+
+export function isLoopbackOrInvalidQrHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h || h === 'localhost' || h === '0.0.0.0' || h === '::1' || h === '::') {
+    return true;
+  }
+  if (net.isIPv4(h)) {
+    return h.startsWith('127.') || h === '0.0.0.0';
+  }
+  return false;
+}
+
+export function validateQrServerUrl(
+  rawUrl: string,
+): { ok: true; url: string } | { ok: false; error: string } {
+  const trimmed = rawUrl.trim().replace(/\/+$/, '');
+  if (!trimmed) {
+    return {
+      ok: false,
+      error: 'Server address is required and cannot be localhost.',
+    };
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return {
+      ok: false,
+      error: 'Invalid server address. Use a full URL such as http://192.168.1.16:8080.',
+    };
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return {
+      ok: false,
+      error: 'Server address must start with http:// or https://.',
+    };
+  }
+  if (isLoopbackOrInvalidQrHost(parsed.hostname)) {
+    return {
+      ok: false,
+      error:
+        'QR pairing cannot use localhost or 127.0.0.1. Use your PC’s Wi-Fi IPv4 address (for example http://192.168.1.16:8080).',
+    };
+  }
+  if (parsed.protocol === 'http:' && !isLocalOrLanAddress(parsed.hostname)) {
+    return {
+      ok: false,
+      error: 'Server addresses outside the trusted local Wi-Fi network must use HTTPS.',
+    };
+  }
+  return { ok: true, url: parsed.origin };
+}
+
+function resolvePublicServerUrl(settings: NetFusionSettings, lanAddresses: string[]): string | null {
+  const envPublic = (process.env.NETFUSION_PUBLIC_URL || '').trim();
+  if (envPublic) {
+    const validated = validateQrServerUrl(envPublic);
+    if (validated.ok) return validated.url;
+  }
+  const preferredIp = lanAddresses.find((ip) => !isLoopbackOrInvalidQrHost(ip));
+  if (!preferredIp) return null;
+  return `http://${preferredIp}:${settings.server_port}`;
 }
 
 function normalizeClientIp(req: Request, bodyIp?: unknown): string {
@@ -156,12 +268,16 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
 
   app.get('/api/health', (_req, res) => {
     const settings = store.getSettings();
+    const lanAddresses = getLanIPv4Addresses();
+    const publicUrl = resolvePublicServerUrl(settings, lanAddresses);
     res.json({
       status: 'ok',
       application: 'NetFusion',
       version: '0.2.0',
+      backend_mode: 'node',
       server_port: settings.server_port,
-      lan_addresses: getLanIPv4Addresses(),
+      public_url: publicUrl,
+      lan_addresses: lanAddresses,
       uptime_seconds: Math.round(process.uptime()),
       timestamp: new Date().toISOString(),
     });
@@ -243,23 +359,37 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
         ? body.platform_hint
         : 'any';
 
-    const generated = store.generatePairingCode(ttl, platformHint);
     const lanAddresses = getLanIPv4Addresses();
     const settings = store.getSettings();
-    const requestedServerUrl =
-      typeof body.server_url === 'string' && /^https?:\/\/[^/\s]+/i.test(body.server_url.trim())
-        ? body.server_url.trim().replace(/\/+$/, '')
-        : lanAddresses.length > 0
-          ? `http://${lanAddresses[0]}:${settings.server_port}`
-          : '';
 
-    const qrPayload = requestedServerUrl
-      ? `netfusion://pair?server=${encodeURIComponent(requestedServerUrl)}&pairing_id=${encodeURIComponent(generated.pairing_id)}&secret=${encodeURIComponent(generated.secret)}`
-      : '';
+    let serverUrl: string | null = null;
+    if (typeof body.server_url === 'string' && body.server_url.trim().length > 0) {
+      const check = validateQrServerUrl(body.server_url);
+      if (!check.ok) {
+        res.status(400).json({ error: check.error, reason: 'invalid_server_url' });
+        return;
+      }
+      serverUrl = check.url;
+    } else {
+      serverUrl = resolvePublicServerUrl(settings, lanAddresses);
+    }
+
+    if (!serverUrl) {
+      res.status(400).json({
+        error:
+          'No active local Wi-Fi IPv4 address was detected. Set NETFUSION_PUBLIC_URL or enter your PC LAN address.',
+        reason: 'missing_lan_address',
+      });
+      return;
+    }
+
+    const generated = store.generatePairingCode(ttl, platformHint);
+    const qrPayload = `netfusion://pair?server=${encodeURIComponent(serverUrl)}&pairing_id=${encodeURIComponent(generated.pairing_id)}&secret=${encodeURIComponent(generated.secret)}`;
 
     res.status(201).json({
       ...generated,
       platform_hint: platformHint,
+      server_url: serverUrl,
       lan_addresses: lanAddresses,
       qr_payload: qrPayload,
     });
@@ -346,9 +476,9 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
     if (!result.ok) {
       pairLimiter.recordFailure(limiterKey);
       const messages: Record<typeof result.reason, string> = {
-        invalid: 'Invalid QR code or pairing secret.',
-        expired: 'Pairing QR code has expired. Generate a new code on the NetFusion dashboard.',
-        used: 'This pairing QR code has already been used.',
+        invalid: 'Authentication failed. Invalid QR code or pairing secret.',
+        expired: 'Pairing code expired. Generate a new QR code on your PC.',
+        used: 'Pairing code already used. Generate a new QR code on your PC.',
         platform_mismatch: 'Pairing code is restricted to a different device platform.',
       };
       res.status(401).json({ error: messages[result.reason], reason: result.reason });
@@ -398,7 +528,7 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
     });
 
     if (!updated) {
-      res.status(401).json({ error: 'Invalid or revoked device authentication token.' });
+      res.status(401).json({ error: 'Authentication failed. Invalid or revoked device token.' });
       return;
     }
 

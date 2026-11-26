@@ -58,8 +58,21 @@ export interface GeneratedPairingCode {
   ttl_seconds: number;
   code_hint: string;
   platform_hint: 'any' | 'android' | 'windows';
+  server_url?: string;
   lan_addresses: string[];
   qr_payload: string;
+}
+
+export interface HealthStatus {
+  status: string;
+  application: string;
+  version: string;
+  backend_mode?: 'go' | 'node';
+  server_port: number;
+  public_url?: string | null;
+  lan_addresses?: string[];
+  uptime_seconds: number;
+  timestamp: string;
 }
 
 export interface PairingStatusSummary {

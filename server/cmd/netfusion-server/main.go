@@ -68,7 +68,7 @@ func main() {
 		}
 	}()
 
-	httpSrv := api.NewServer(cfg, store, discoverer, collector, pairingSvc)
+	httpSrv := api.NewServer(cfg, store, discoverer, collector, monitor, pairingSvc)
 	go func() {
 		if err := httpSrv.ListenAndServe(); err != nil {
 			log.Printf("api server stopped: %v", err)

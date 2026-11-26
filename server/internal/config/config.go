@@ -70,7 +70,7 @@ func Load(path string) (*Config, error) {
 		cfg.Network.MonitorIntervalSeconds = 3
 	}
 	if cfg.Server.Port <= 0 {
-		cfg.Server.Port = 8765
+		cfg.Server.Port = 8080
 	}
 	return &cfg, nil
 }

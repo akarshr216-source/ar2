@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   AdminAuthStatus,
   GeneratedPairingCode,
+  HealthStatus,
   NetFusionSettings,
   PairedDevice,
   PairingStatusSummary,
@@ -10,10 +11,25 @@ import type {
 
 const DEFAULT_API_BASE = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
 
+function toReadableNetworkError(err: unknown, fallback: string): string {
+  if (err instanceof DOMException && err.name === 'AbortError') {
+    return 'Connection timed out while contacting the NetFusion server.';
+  }
+  if (err instanceof TypeError) {
+    return 'Server is offline or cannot be reached. Verify that the NetFusion API server is running.';
+  }
+  if (err instanceof Error && err.message.trim()) {
+    return err.message;
+  }
+  return fallback;
+}
+
 export function useNetFusion() {
   const [apiBaseUrl, setApiBaseUrlState] = useState<string>(DEFAULT_API_BASE);
   const [snapshot, setSnapshot] = useState<TelemetrySnapshot | null>(null);
   const [lanAddresses, setLanAddresses] = useState<string[]>([]);
+  const [publicUrl, setPublicUrl] = useState<string | null>(null);
+  const [backendMode, setBackendMode] = useState<'go' | 'node' | null>(null);
   const [clients, setClients] = useState<PairedDevice[]>([]);
   const [clientsLoading, setClientsLoading] = useState(false);
   const [clientsError, setClientsError] = useState<string | null>(null);
@@ -106,7 +122,7 @@ export function useNetFusion() {
         if (clientsRes.status === 401 || pairingRes.status === 401) {
           setAdminToken(null);
           setAdminAuthStatus((prev) => ({ ...prev, authenticated: false }));
-          setClientsError('Administrator session expired. Enter your password to continue.');
+          setClientsError('Authentication failed. Administrator session expired.');
           return;
         }
 
@@ -122,7 +138,7 @@ export function useNetFusion() {
           setPairingStatus((await pairingRes.json()) as PairingStatusSummary);
         }
       } catch (err) {
-        setClientsError(err instanceof Error ? err.message : 'Unable to fetch devices');
+        setClientsError(toReadableNetworkError(err, 'Unable to reach NetFusion server to fetch devices.'));
       } finally {
         setClientsLoading(false);
       }
@@ -134,8 +150,10 @@ export function useNetFusion() {
     try {
       const res = await fetch(apiUrl('/api/health'));
       if (res.ok) {
-        const data = (await res.json()) as { lan_addresses?: string[] };
+        const data = (await res.json()) as HealthStatus;
         setLanAddresses(data.lan_addresses ?? []);
+        setPublicUrl(data.public_url ?? null);
+        setBackendMode(data.backend_mode ?? null);
       }
     } catch {
       // Ignore transient errors
@@ -148,7 +166,10 @@ export function useNetFusion() {
     const loadInitial = async () => {
       try {
         const res = await fetch(apiUrl('/api/metrics'));
-        if (!res.ok) throw new Error('Unable to reach NetFusion server');
+        if (!res.ok) {
+          const body = (await res.json().catch(() => ({}))) as { error?: string };
+          throw new Error(body.error || 'NetFusion server is offline or unreachable.');
+        }
         const data = (await res.json()) as TelemetrySnapshot;
         if (!active) return;
         setSnapshot(data);
@@ -156,7 +177,7 @@ export function useNetFusion() {
         setError(null);
       } catch (err) {
         if (!active) return;
-        setError(err instanceof Error ? err.message : 'Connection failed');
+        setError(toReadableNetworkError(err, 'NetFusion server is offline or unreachable.'));
       } finally {
         if (active) setLoading(false);
       }
@@ -223,33 +244,41 @@ export function useNetFusion() {
   }, [snapshot?.settings.theme, applyThemeToDom]);
 
   const claimAdminPasscode = async (passcode: string) => {
-    const res = await fetch(apiUrl('/api/admin/claim'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ passcode }),
-    });
-    const data = (await res.json()) as { admin_token?: string; error?: string };
-    if (!res.ok || !data.admin_token) {
-      throw new Error(data.error || 'Failed to set administrator password');
+    try {
+      const res = await fetch(apiUrl('/api/admin/claim'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passcode }),
+      });
+      const data = (await res.json()) as { admin_token?: string; error?: string };
+      if (!res.ok || !data.admin_token) {
+        throw new Error(data.error || 'Failed to set administrator password');
+      }
+      setAdminToken(data.admin_token);
+      setAdminAuthStatus({ configured_via_env: false, claimed: true, authenticated: true });
+      await fetchClientsAndPairing(data.admin_token);
+    } catch (err) {
+      throw new Error(toReadableNetworkError(err, 'Failed to set administrator password'));
     }
-    setAdminToken(data.admin_token);
-    setAdminAuthStatus({ configured_via_env: false, claimed: true, authenticated: true });
-    await fetchClientsAndPairing(data.admin_token);
   };
 
   const loginAdmin = async (passcode: string) => {
-    const res = await fetch(apiUrl('/api/admin/login'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ passcode }),
-    });
-    const data = (await res.json()) as { admin_token?: string; error?: string };
-    if (!res.ok || !data.admin_token) {
-      throw new Error(data.error || 'Incorrect administrator password');
+    try {
+      const res = await fetch(apiUrl('/api/admin/login'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passcode }),
+      });
+      const data = (await res.json()) as { admin_token?: string; error?: string };
+      if (!res.ok || !data.admin_token) {
+        throw new Error(data.error || 'Authentication failed. Incorrect administrator password.');
+      }
+      setAdminToken(data.admin_token);
+      setAdminAuthStatus((prev) => ({ ...prev, claimed: true, authenticated: true }));
+      await fetchClientsAndPairing(data.admin_token);
+    } catch (err) {
+      throw new Error(toReadableNetworkError(err, 'Authentication failed.'));
     }
-    setAdminToken(data.admin_token);
-    setAdminAuthStatus((prev) => ({ ...prev, claimed: true, authenticated: true }));
-    await fetchClientsAndPairing(data.admin_token);
   };
 
   const logoutAdmin = async () => {
@@ -271,41 +300,49 @@ export function useNetFusion() {
     serverUrl?: string;
   }): Promise<GeneratedPairingCode> => {
     if (!adminToken) {
-      throw new Error('Administrator authentication required');
+      throw new Error('Authentication failed. Administrator session required.');
     }
-    const res = await fetch(apiUrl('/api/pairing/generate'), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${adminToken}`,
-      },
-      body: JSON.stringify({
-        platform_hint: options?.platformHint ?? 'any',
-        ttl_seconds: options?.ttlSeconds ?? 120,
-        server_url: options?.serverUrl,
-      }),
-    });
-    const data = (await res.json()) as GeneratedPairingCode & { error?: string };
-    if (!res.ok) {
-      throw new Error(data.error || 'Failed to generate QR pairing code');
+    try {
+      const res = await fetch(apiUrl('/api/pairing/generate'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify({
+          platform_hint: options?.platformHint ?? 'any',
+          ttl_seconds: options?.ttlSeconds ?? 120,
+          server_url: options?.serverUrl,
+        }),
+      });
+      const data = (await res.json()) as GeneratedPairingCode & { error?: string };
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to generate QR pairing code');
+      }
+      await fetchClientsAndPairing(adminToken);
+      return data;
+    } catch (err) {
+      throw new Error(toReadableNetworkError(err, 'Failed to generate QR pairing code'));
     }
-    await fetchClientsAndPairing(adminToken);
-    return data;
   };
 
   const revokeClient = async (id: string) => {
     if (!adminToken) return;
-    const res = await fetch(apiUrl(`/api/clients/${encodeURIComponent(id)}`), {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${adminToken}` },
-    });
-    if (res.ok) {
-      const data = (await res.json()) as { clients: PairedDevice[] };
-      setClients(data.clients);
-      await fetchClientsAndPairing(adminToken);
-    } else {
-      const err = (await res.json().catch(() => ({}))) as { error?: string };
-      setClientsError(err.error || 'Failed to remove device');
+    try {
+      const res = await fetch(apiUrl(`/api/clients/${encodeURIComponent(id)}`), {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${adminToken}` },
+      });
+      if (res.ok) {
+        const data = (await res.json()) as { clients: PairedDevice[] };
+        setClients(data.clients);
+        await fetchClientsAndPairing(adminToken);
+      } else {
+        const err = (await res.json().catch(() => ({}))) as { error?: string };
+        setClientsError(err.error || 'Failed to remove device');
+      }
+    } catch (err) {
+      setClientsError(toReadableNetworkError(err, 'Failed to remove device'));
     }
   };
 
@@ -334,6 +371,9 @@ export function useNetFusion() {
     if (res.ok) {
       const data = (await res.json()) as { settings: NetFusionSettings };
       setSnapshot((prev) => (prev ? { ...prev, settings: data.settings } : prev));
+      if (patch.server_port !== undefined) {
+        void fetchHealth();
+      }
     }
   };
 
@@ -341,6 +381,8 @@ export function useNetFusion() {
     apiBaseUrl,
     setApiBaseUrl,
     lanAddresses,
+    publicUrl,
+    backendMode,
     snapshot,
     clients,
     clientsLoading,

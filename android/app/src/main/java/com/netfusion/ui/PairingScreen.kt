@@ -81,11 +81,14 @@ fun PairingScreen(
     val lastHeartbeat by heartbeatManager.lastHeartbeatAt.collectAsState()
     val traffic by heartbeatManager.traffic.collectAsState()
 
-    var serverUrl by remember { mutableStateOf(tokenStore.serverUrl) }
+    var serverUrl by remember {
+        mutableStateOf(tokenStore.serverUrl.ifBlank { "http://192.168.1.16:8080" })
+    }
     var deviceName by remember { mutableStateOf(tokenStore.deviceName ?: deviceInfo.getDeviceModel()) }
     var manualPairingId by remember { mutableStateOf("") }
     var manualSecret by remember { mutableStateOf("") }
     var statusMessage by remember { mutableStateOf<String?>(null) }
+    var pairedNotice by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
     var scanningQr by remember { mutableStateOf(false) }
     var showManualFallback by remember { mutableStateOf(false) }
@@ -122,11 +125,19 @@ fun PairingScreen(
         pairingId: String?,
         secret: String,
     ) {
+        val validated = QrPairingParser.validateServerUrl(targetServerUrl, addHttpIfMissing = true)
+            .getOrElse { err ->
+                pendingQrConfirmation = null
+                statusMessage = err.message ?: "Invalid server address."
+                return
+            }
+
         busy = true
         statusMessage = null
+        pairedNotice = null
         scope.launch {
             val result = api.pairDevice(
-                baseUrl = targetServerUrl,
+                baseUrl = validated.serverUrl,
                 payload = PairRequest(
                     pairingId = pairingId?.takeIf { it.isNotBlank() },
                     secret = secret.trim(),
@@ -138,18 +149,20 @@ fun PairingScreen(
                 ),
             )
             result.onSuccess { resp ->
-                tokenStore.serverUrl = targetServerUrl
+                tokenStore.serverUrl = validated.serverUrl
                 tokenStore.authToken = resp.authToken
                 tokenStore.deviceId = resp.device.id
                 tokenStore.deviceName = resp.device.name
                 tokenStore.heartbeatIntervalSeconds = resp.heartbeatIntervalSeconds
-                serverUrl = targetServerUrl
+                serverUrl = validated.serverUrl
                 manualPairingId = ""
                 manualSecret = ""
                 pendingQrConfirmation = null
+                pairedNotice = "Device successfully paired. Sending initial heartbeat..."
                 heartbeatManager.start()
             }.onFailure { err ->
                 pendingQrConfirmation = null
+                pairedNotice = null
                 statusMessage = err.message ?: "Unable to connect to the NetFusion server."
             }
             busy = false
@@ -272,7 +285,7 @@ fun PairingScreen(
             ) {
                 val statusLabel = when (connectionState) {
                     ClientConnectionState.UNPAIRED -> "Not paired"
-                    ClientConnectionState.CONNECTING -> "Connecting to server..."
+                    ClientConnectionState.CONNECTING -> "Device paired — connecting..."
                     ClientConnectionState.CONNECTED -> "Connected"
                     ClientConnectionState.DISCONNECTED -> "Disconnected"
                 }
@@ -281,6 +294,13 @@ fun PairingScreen(
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
                 )
+                if (connectionState == ClientConnectionState.CONNECTING && pairedNotice != null) {
+                    Text(
+                        text = pairedNotice ?: "",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
                 if (tokenStore.serverUrl.isNotBlank() && connectionState != ClientConnectionState.UNPAIRED) {
                     Text(
                         text = "Server: ${tokenStore.serverUrl}",
@@ -389,7 +409,7 @@ fun PairingScreen(
                         OutlinedTextField(
                             value = serverUrl,
                             onValueChange = { serverUrl = it },
-                            label = { Text("PC Server Address (e.g. http://192.168.1.10:8080)") },
+                            label = { Text("PC Server Address (e.g. http://192.168.1.16:8080)") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
@@ -412,7 +432,7 @@ fun PairingScreen(
                             modifier = Modifier.fillMaxWidth(),
                             onClick = {
                                 executePairing(
-                                    targetServerUrl = serverUrl.trim().trimEnd('/'),
+                                    targetServerUrl = serverUrl,
                                     pairingId = manualPairingId.trim().ifBlank { null },
                                     secret = manualSecret.trim(),
                                 )
