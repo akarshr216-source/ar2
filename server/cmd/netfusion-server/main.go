@@ -11,13 +11,10 @@ import (
 
 	"netfusion/server/internal/api"
 	"netfusion/server/internal/auth"
-	"netfusion/server/internal/bonding"
 	"netfusion/server/internal/config"
 	"netfusion/server/internal/database"
 	"netfusion/server/internal/metrics"
 	"netfusion/server/internal/network"
-	"netfusion/server/internal/scheduler"
-	"netfusion/server/internal/streaming"
 )
 
 func main() {
@@ -55,9 +52,6 @@ func main() {
 	collector := metrics.NewCollector(store)
 	discoverer := network.NewDiscoverer()
 	monitor := network.NewMonitor(discoverer, collector, time.Duration(cfg.Network.MonitorIntervalSeconds)*time.Second)
-	sched := scheduler.NewWeightedHealthScheduler(cfg.LoadBalancing.Algorithm)
-	classifier := streaming.NewClassifier(cfg.Streaming)
-	bondMgr := bonding.NewManager(cfg.Bonding.Enabled)
 	pairingSvc := auth.NewPairingService(store, timeoutS)
 
 	go monitor.Start(ctx)
@@ -74,7 +68,7 @@ func main() {
 		}
 	}()
 
-	httpSrv := api.NewServer(cfg, store, discoverer, collector, sched, classifier, bondMgr, pairingSvc)
+	httpSrv := api.NewServer(cfg, store, discoverer, collector, pairingSvc)
 	go func() {
 		if err := httpSrv.ListenAndServe(); err != nil {
 			log.Printf("api server stopped: %v", err)

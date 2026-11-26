@@ -1,26 +1,31 @@
 # NetFusion
 
-Cross-platform multi-network monitoring, load balancing, streaming QoS, and authenticated device pairing control plane.
+Simple, secure QR-code device pairing and real operating-system network monitoring across Windows PC and Android phones over your local Wi-Fi network.
 
 ## Repository Layout
-- `server/` — Go Windows/LAN monitoring server, SQLite migrations (`001_init.sql`), and pairing/heartbeat API (`cmd/netfusion-server`).
-- `server-runtime/` & `server.ts` — Live Node.js/Express + SQLite (`node:sqlite`) control plane & SSE telemetry engine serving the web dashboard.
-- `android/` — Android Kotlin + Jetpack Compose client (`TokenStore` via `EncryptedSharedPreferences`, `DeviceInfoProvider`, `HeartbeatManager`, `PairingScreen`).
-- `deployment/windows/` — Windows PowerShell launch and LocalSubnet Firewall configuration scripts.
-- `tests/` — Automated integration tests (`device-pairing.test.ts`).
-- `src/` — React + TypeScript dual-theme (Light/Dark) NetFusion Dashboard.
+- `server/` — Go Windows/LAN control plane, SQLite schema (`migrations/001_init.sql`), pairing/rate-limit middleware, and OS network monitor (`cmd/netfusion-server`).
+- `server-runtime/` & `server.ts` — Node.js/Express + SQLite (`node:sqlite`) control plane & SSE telemetry server.
+- `src/` — Beginner-friendly React + TypeScript dashboard (**Dashboard**, **Devices**, **Networks**, **Settings**) with **Add Device** QR pairing.
+- `android/` — Android Kotlin + Jetpack Compose app with CameraX + ML Kit QR scanning, server confirmation prompt, `EncryptedSharedPreferences`, and `TrafficStats` heartbeat reporting.
+- `deployment/windows/` — PowerShell firewall (`LocalSubnet`) and Windows launch scripts.
+- `tests/` — Automated pairing, security, and persistence test suite (`device-pairing.test.ts`).
 
-## Running on Windows Server (Go)
-```powershell
-.\deployment\windows\configure-firewall.ps1
-.\deployment\windows\run-server.ps1
-```
-Environment variables used:
-- `NETFUSION_DB_PATH=C:\NetFusion\data\netfusion.db` (directory created automatically)
-- `NETFUSION_HOST_BIND=0.0.0.0:8080`
-- `NETFUSION_ADMIN_PASSCODE=<your-admin-passcode>`
+## Quick Start (Windows Server + Android QR Pairing)
+1. Start the Windows server:
+   ```powershell
+   .\deployment\windows\configure-firewall.ps1
+   .\deployment\windows\run-server.ps1
+   ```
+   Key environment variables:
+   - `NETFUSION_DB_PATH=C:\NetFusion\data\netfusion.db`
+   - `NETFUSION_HOST_BIND=0.0.0.0:8080`
+   - `NETFUSION_ADMIN_PASSCODE=<your-admin-passcode>`
 
-## Running the Live Control Plane & Tests
+2. Open the dashboard (`http://localhost:8080` or your PC's LAN IP) and set or unlock your administrator password.
+3. Click **Add Device** to generate a single-use QR code valid for 2 minutes (`netfusion://pair?server=...&pairing_id=...&secret=...`).
+4. Open the **NetFusion** app on your Android phone on the same Wi-Fi network, tap **Scan QR Code**, verify the server address in the confirmation prompt, and tap **Connect**.
+
+## Development & Automated Tests
 ```bash
 npm install
 npm run dev

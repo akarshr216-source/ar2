@@ -1,39 +1,27 @@
-import {
-  Activity,
-  FolderCode,
-  GitFork,
-  Layers,
-  Network,
-  Settings,
-  Smartphone,
-  X,
-} from 'lucide-react';
+import { LayoutDashboard, Network, Settings, Smartphone, X } from 'lucide-react';
 import type { NavSection } from '../types/netfusion';
 
 interface SidebarProps {
   activeSection: NavSection;
   onSelect: (section: NavSection) => void;
-  gatewayMode: boolean;
   mobileOpen: boolean;
   onCloseMobile: () => void;
+  connectedDevicesCount: number;
 }
 
-const NAV_ITEMS: Array<{ id: NavSection; label: string; icon: typeof Activity }> = [
-  { id: 'overview', label: 'Overview', icon: Activity },
-  { id: 'interfaces', label: 'Interfaces', icon: Network },
-  { id: 'streaming', label: 'Streaming & QoS', icon: Layers },
-  { id: 'clients', label: 'Clients & Pairing', icon: Smartphone },
-  { id: 'bonding', label: 'Bonding Engine', icon: GitFork },
-  { id: 'repository', label: 'Go v0.1 Source', icon: FolderCode },
+const NAV_ITEMS: Array<{ id: NavSection; label: string; icon: typeof LayoutDashboard }> = [
+  { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
+  { id: 'devices', label: 'Devices', icon: Smartphone },
+  { id: 'networks', label: 'Networks', icon: Network },
   { id: 'settings', label: 'Settings', icon: Settings },
 ];
 
 export function Sidebar({
   activeSection,
   onSelect,
-  gatewayMode,
   mobileOpen,
   onCloseMobile,
+  connectedDevicesCount,
 }: SidebarProps) {
   const navContent = (
     <div className="flex h-full flex-col justify-between bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800">
@@ -64,31 +52,36 @@ export function Sidebar({
                   onSelect(item.id);
                   onCloseMobile();
                 }}
-                className={`w-full flex items-center gap-3 px-3 py-2.5 text-sm font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 ${
+                className={`w-full flex items-center justify-between gap-3 px-3 py-2.5 text-sm font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 ${
                   isActive
                     ? 'bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-400'
                     : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100 dark:text-slate-400 dark:hover:text-slate-100 dark:hover:bg-slate-800/70'
                 }`}
               >
-                <Icon className="w-4 h-4 shrink-0" />
-                <span className="truncate">{item.label}</span>
+                <span className="flex items-center gap-3 min-w-0">
+                  <Icon className="w-4 h-4 shrink-0" />
+                  <span className="truncate">{item.label}</span>
+                </span>
+                {item.id === 'devices' && connectedDevicesCount > 0 && (
+                  <span className="text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400">
+                    {connectedDevicesCount}
+                  </span>
+                )}
               </button>
             );
           })}
         </nav>
       </div>
 
-      <div className="p-4 border-t border-slate-200 dark:border-slate-800 space-y-1.5">
+      <div className="p-4 border-t border-slate-200 dark:border-slate-800 space-y-1">
         <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
-          Routing State
+          Pairing Method
         </div>
         <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-          {gatewayMode ? 'Gateway Mode Active' : 'Monitoring Mode'}
+          QR Code Local Pairing
         </div>
         <p className="text-xs leading-relaxed text-slate-500 dark:text-slate-400">
-          {gatewayMode
-            ? 'Forwarding paired LAN client traffic across healthy uplinks.'
-            : 'Observing host NICs and upstream links without altering OS routes.'}
+          Pair phones over your Wi-Fi network using temporary 2-minute QR codes.
         </p>
       </div>
     </div>

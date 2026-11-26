@@ -8,7 +8,6 @@ export interface NetworkInterfaceRecord {
   mac_address: string;
   is_host_detected: number;
   enabled: number;
-  simulated_down: number;
   weight: number;
   priority_order: number;
   status: 'healthy' | 'degraded' | 'offline' | 'disabled';
@@ -18,14 +17,15 @@ export interface NetworkInterfaceRecord {
 export interface NetworkMetricRecord {
   id?: number;
   interface_id: string;
-  download_mbps: number;
-  upload_mbps: number;
-  latency_ms: number;
-  jitter_ms: number;
-  packet_loss_pct: number;
-  health_score: number;
-  rx_bytes: number;
-  tx_bytes: number;
+  download_mbps: number | null;
+  upload_mbps: number | null;
+  latency_ms: number | null;
+  jitter_ms: number | null;
+  packet_loss_pct: number | null;
+  health_score: number | null;
+  rx_bytes: number | null;
+  tx_bytes: number | null;
+  metrics_available: boolean;
   probe_source: string;
   recorded_at: string;
 }
@@ -43,6 +43,10 @@ export interface DeviceRecord {
   pairing_status: DevicePairingStatus;
   connection_status: DeviceConnectionStatus;
   app_version: string;
+  rx_bytes: number | null;
+  tx_bytes: number | null;
+  download_bps: number | null;
+  upload_bps: number | null;
   last_seen_at: string;
   created_at: string;
 }
@@ -50,35 +54,13 @@ export interface DeviceRecord {
 export interface PairingStatusSummary {
   active_codes: number;
   latest_code_expires_at: string | null;
+  latest_pairing_id: string | null;
   latest_code_hint: string | null;
   platform_hint: DevicePlatform | 'any' | null;
   registered_devices: number;
   connected_devices: number;
   disconnected_devices: number;
   heartbeat_timeout_seconds: number;
-}
-
-export interface StreamingProfileRecord {
-  id: string;
-  name: string;
-  description: string;
-  realtime_priority: number;
-  gaming_priority: number;
-  video_priority: number;
-  normal_priority: number;
-  background_priority: number;
-  is_active: number;
-}
-
-export interface QosRuleRecord {
-  id: string;
-  app_name: string;
-  match_pattern: string;
-  tier: 'P0' | 'P1' | 'P2' | 'P3' | 'P4';
-  priority_weight: number;
-  preferred_interface_id: string | null;
-  enabled: number;
-  created_at: string;
 }
 
 export interface UsageStatRecord {
@@ -99,22 +81,14 @@ export interface SystemEventRecord {
 
 export interface NetFusionSettings {
   theme: 'light' | 'dark' | 'system';
-  gateway_mode: boolean;
   server_port: number;
   lan_only: boolean;
   auto_discovery: boolean;
   monitor_interval_seconds: number;
   heartbeat_timeout_seconds: number;
   pairing_code_ttl_seconds: number;
-  automatic_failover: boolean;
-  load_balancing_enabled: boolean;
-  load_balancing_algorithm: 'weighted_health' | 'lowest_latency' | 'round_robin';
-  bonding_enabled: boolean;
-  relay_mode: string;
 }
 
 export interface InterfaceWithMetrics extends NetworkInterfaceRecord {
   latest_metric: NetworkMetricRecord | null;
-  traffic_share_pct: number;
-  is_primary_failover: boolean;
 }

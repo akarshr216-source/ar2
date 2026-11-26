@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import type http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
-import { createNetFusionApp, type NetFusionAppInstance } from '../server-runtime/app.ts';
+import { createNetFusionApp, isLocalOrLanAddress, type NetFusionAppInstance } from '../server-runtime/app.ts';
 
 function startListening(instance: NetFusionAppInstance): Promise<{ server: http.Server; baseUrl: string }> {
   return new Promise((resolve) => {
@@ -18,7 +19,7 @@ function startListening(instance: NetFusionAppInstance): Promise<{ server: http.
   });
 }
 
-describe('NetFusion real device detection, pairing, and heartbeat lifecycle', () => {
+describe('NetFusion QR pairing, real device registry, and zero-mock networking', () => {
   let tmpDir: string;
   let dbPath: string;
   let instance: NetFusionAppInstance;
@@ -36,7 +37,6 @@ describe('NetFusion real device detection, pairing, and heartbeat lifecycle', ()
     server = started.server;
     baseUrl = started.baseUrl;
 
-    // Claim administrator access for device management tests
     const claimRes = await fetch(`${baseUrl}/api/admin/claim`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -53,7 +53,7 @@ describe('NetFusion real device detection, pairing, and heartbeat lifecycle', ()
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('1. returns empty device registry when no Android/Windows devices are paired', async () => {
+  it('1. returns empty device registry and zero fake WAN interfaces', async () => {
     const res = await fetch(`${baseUrl}/api/clients`, {
       headers: { Authorization: `Bearer ${adminToken}` },
     });
@@ -66,64 +66,79 @@ describe('NetFusion real device detection, pairing, and heartbeat lifecycle', ()
     });
     const statusBody = (await statusRes.json()) as { registered_devices: number };
     assert.equal(statusBody.registered_devices, 0);
+
+    const ifacesRes = await fetch(`${baseUrl}/api/interfaces`);
+    assert.equal(ifacesRes.status, 200);
+    const ifacesBody = (await ifacesRes.json()) as { interfaces: Array<{ id: string; is_host_detected: number }> };
+    for (const iface of ifacesBody.interfaces) {
+      assert.ok(!['wan-airtel', 'wan-jio', 'wan-wifi'].includes(iface.id));
+      assert.equal(iface.is_host_detected, 1);
+    }
   });
 
-  it('10. rejects unauthorized registration, heartbeat, and admin endpoints', async () => {
-    const unauthClients = await fetch(`${baseUrl}/api/clients`);
-    assert.equal(unauthClients.status, 401);
-
-    const unauthGen = await fetch(`${baseUrl}/api/pairing/generate`, { method: 'POST' });
-    assert.equal(unauthGen.status, 401);
-
-    const unauthPair = await fetch(`${baseUrl}/api/clients/pair`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        device_name: 'Rogue Phone',
-        platform: 'android',
-      }),
-    });
-    assert.equal(unauthPair.status, 401);
-
-    const unauthHeartbeat = await fetch(`${baseUrl}/api/clients/heartbeat`, {
+  it('2. generates single-use 2-minute QR payload without auth_token', async () => {
+    const res = await fetch(`${baseUrl}/api/pairing/generate`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: 'Bearer nf_dev_invalidtoken',
+        Authorization: `Bearer ${adminToken}`,
       },
-      body: JSON.stringify({ ip_address: '192.168.1.99' }),
+      body: JSON.stringify({
+        platform_hint: 'android',
+        server_url: 'http://192.168.1.10:8080',
+      }),
     });
-    assert.equal(unauthHeartbeat.status, 401);
+    assert.equal(res.status, 201);
+    const body = (await res.json()) as {
+      pairing_id: string;
+      secret: string;
+      ttl_seconds: number;
+      qr_payload: string;
+      auth_token?: string;
+    };
+
+    assert.equal(body.ttl_seconds, 120);
+    assert.equal(body.auth_token, undefined);
+    assert.ok(body.qr_payload.startsWith('netfusion://pair?'));
+
+    const parsed = new URL(body.qr_payload);
+    assert.equal(parsed.searchParams.get('server'), 'http://192.168.1.10:8080');
+    assert.equal(parsed.searchParams.get('pairing_id'), body.pairing_id);
+    assert.equal(parsed.searchParams.get('secret'), body.secret);
+    assert.equal(parsed.searchParams.get('auth_token'), null);
+    assert.equal(parsed.searchParams.get('token'), null);
   });
 
-  it('6 & 7. rejects invalid, expired, and already-used pairing codes', async () => {
+  it('3 & 4. rejects invalid and expired QR pairing sessions', async () => {
     const invalidRes = await fetch(`${baseUrl}/api/clients/pair`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        pairing_code: 'NF-0000-0000',
+        pairing_id: 'pc-nonexistent',
+        secret: 'NF-0000-0000-0000',
         device_name: 'Pixel Test',
         platform: 'android',
       }),
     });
     assert.equal(invalidRes.status, 401);
+    const invalidBody = (await invalidRes.json()) as { reason: string };
+    assert.equal(invalidBody.reason, 'invalid');
 
-    // Insert an already-expired code directly to test expiry without waiting 30s
-    const expiredCode = 'NF-EXPR-9999';
-    const { default: crypto } = await import('node:crypto');
-    const codeHash = crypto.createHash('sha256').update('NFEXPR9999').digest('hex');
+    const expiredSecret = 'NF-EXPR-9999-ABCD';
+    const secretHash = crypto.createHash('sha256').update('NFEXPR9999ABCD').digest('hex');
     instance.store.db
       .prepare(
         `INSERT INTO pairing_codes (id, code_hash, code_hint, platform_hint, expires_at, created_at)
-         VALUES ('pc-expired', ?, 'NF-****-**99', 'android', ?, ?)`,
+         VALUES ('pc-expired-qr', ?, 'pc-expired-qr', 'android', ?, ?)`,
       )
-      .run(codeHash, new Date(Date.now() - 10_000).toISOString(), new Date(Date.now() - 60_000).toISOString());
+      .run(secretHash, new Date(Date.now() - 10_000).toISOString(), new Date(Date.now() - 130_000).toISOString());
 
     const expiredRes = await fetch(`${baseUrl}/api/clients/pair`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        pairing_code: expiredCode,
+        pairing_id: 'pc-expired-qr',
+        secret: expiredSecret,
         device_name: 'Pixel Test',
         platform: 'android',
       }),
@@ -133,7 +148,7 @@ describe('NetFusion real device detection, pairing, and heartbeat lifecycle', ()
     assert.equal(expiredBody.reason, 'expired');
   });
 
-  it('2 & 3. pairs one and then a second real Android device with single-use codes', async () => {
+  it('5. pairs real Android devices via QR secret, separates pairing vs live connection, and blocks QR reuse', async () => {
     const gen1 = await fetch(`${baseUrl}/api/pairing/generate`, {
       method: 'POST',
       headers: {
@@ -143,43 +158,75 @@ describe('NetFusion real device detection, pairing, and heartbeat lifecycle', ()
       body: JSON.stringify({ platform_hint: 'android', ttl_seconds: 120 }),
     });
     assert.equal(gen1.status, 201);
-    const code1 = ((await gen1.json()) as { pairing_code: string }).pairing_code;
+    const gen1Body = (await gen1.json()) as { pairing_id: string; secret: string };
 
     const pair1 = await fetch(`${baseUrl}/api/clients/pair`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        pairing_code: code1,
+        pairing_id: gen1Body.pairing_id,
+        secret: gen1Body.secret,
         device_name: 'Akarsh Pixel 9',
         platform: 'android',
         device_model: 'Google Pixel 9 Pro',
         ip_address: '192.168.1.41',
-        app_version: '1.0.0',
+        app_version: '0.2.0',
       }),
     });
     assert.equal(pair1.status, 201);
     const pair1Body = (await pair1.json()) as {
-      device: { id: string; connection_status: string; device_model: string };
+      device: { id: string; pairing_status: string; connection_status: string; device_model: string };
       auth_token: string;
     };
-    assert.equal(pair1Body.device.connection_status, 'connected');
+
+    // Pairing and live connectivity are distinct: device starts paired + disconnected until first heartbeat arrives
+    assert.equal(pair1Body.device.pairing_status, 'paired');
+    assert.equal(pair1Body.device.connection_status, 'disconnected');
     assert.equal(pair1Body.device.device_model, 'Google Pixel 9 Pro');
+    assert.ok(pair1Body.auth_token.startsWith('nf_dev_'));
     firstDeviceToken = pair1Body.auth_token;
     firstDeviceId = pair1Body.device.id;
 
-    // Verify single-use code cannot be reused
+    // QR session cannot be reused
     const reuseRes = await fetch(`${baseUrl}/api/clients/pair`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        pairing_code: code1,
+        pairing_id: gen1Body.pairing_id,
+        secret: gen1Body.secret,
         device_name: 'Clone Phone',
         platform: 'android',
       }),
     });
     assert.equal(reuseRes.status, 401);
+    const reuseBody = (await reuseRes.json()) as { reason: string };
+    assert.equal(reuseBody.reason, 'used');
 
-    // Pair second real Android device
+    // First authenticated heartbeat transitions device to connected & stores real traffic bytes
+    const hb1 = await fetch(`${baseUrl}/api/clients/heartbeat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${firstDeviceToken}`,
+      },
+      body: JSON.stringify({
+        ip_address: '192.168.1.41',
+        app_version: '0.2.0',
+        rx_bytes: 125_000_000,
+        tx_bytes: 24_000_000,
+        download_bps: 4_800_000,
+        upload_bps: 1_200_000,
+      }),
+    });
+    assert.equal(hb1.status, 200);
+    const hb1Body = (await hb1.json()) as {
+      device: { connection_status: string; download_bps: number | null; upload_bps: number | null };
+    };
+    assert.equal(hb1Body.device.connection_status, 'connected');
+    assert.equal(hb1Body.device.download_bps, 4_800_000);
+    assert.equal(hb1Body.device.upload_bps, 1_200_000);
+
+    // Pair second real device
     const gen2 = await fetch(`${baseUrl}/api/pairing/generate`, {
       method: 'POST',
       headers: {
@@ -188,17 +235,18 @@ describe('NetFusion real device detection, pairing, and heartbeat lifecycle', ()
       },
       body: JSON.stringify({ platform_hint: 'android' }),
     });
-    const code2 = ((await gen2.json()) as { pairing_code: string }).pairing_code;
+    const gen2Body = (await gen2.json()) as { pairing_id: string; secret: string };
     const pair2 = await fetch(`${baseUrl}/api/clients/pair`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        pairing_code: code2,
+        pairing_id: gen2Body.pairing_id,
+        secret: gen2Body.secret,
         device_name: 'Work Galaxy S25',
         platform: 'android',
         device_model: 'Samsung SM-S931B',
         ip_address: '192.168.1.58',
-        app_version: '1.0.0',
+        app_version: '0.2.0',
       }),
     });
     assert.equal(pair2.status, 201);
@@ -210,8 +258,7 @@ describe('NetFusion real device detection, pairing, and heartbeat lifecycle', ()
     assert.equal(listBody.clients.length, 2);
   });
 
-  it('4 & 5. marks device disconnected after heartbeat timeout and restores connected on heartbeat', async () => {
-    // Age first device's last_seen_at past heartbeat timeout (15s)
+  it('6. marks device disconnected after heartbeat timeout and restores connected on next heartbeat', async () => {
     const staleIso = new Date(Date.now() - 30_000).toISOString();
     instance.store.db.prepare(`UPDATE devices SET last_seen_at = ? WHERE id = ?`).run(staleIso, firstDeviceId);
 
@@ -219,19 +266,19 @@ describe('NetFusion real device detection, pairing, and heartbeat lifecycle', ()
       headers: { Authorization: `Bearer ${adminToken}` },
     });
     const listBody = (await listRes.json()) as {
-      clients: Array<{ id: string; connection_status: string }>;
+      clients: Array<{ id: string; pairing_status: string; connection_status: string }>;
     };
     const dev1 = listBody.clients.find((c) => c.id === firstDeviceId);
+    assert.equal(dev1?.pairing_status, 'paired');
     assert.equal(dev1?.connection_status, 'disconnected');
 
-    // Device reconnects via authenticated heartbeat
     const hbRes = await fetch(`${baseUrl}/api/clients/heartbeat`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${firstDeviceToken}`,
       },
-      body: JSON.stringify({ ip_address: '192.168.1.42', app_version: '1.0.1' }),
+      body: JSON.stringify({ ip_address: '192.168.1.42', app_version: '0.2.1' }),
     });
     assert.equal(hbRes.status, 200);
     const hbBody = (await hbRes.json()) as {
@@ -239,20 +286,18 @@ describe('NetFusion real device detection, pairing, and heartbeat lifecycle', ()
     };
     assert.equal(hbBody.device.connection_status, 'connected');
     assert.equal(hbBody.device.ip_address, '192.168.1.42');
-    assert.equal(hbBody.device.app_version, '1.0.1');
+    assert.equal(hbBody.device.app_version, '0.2.1');
   });
 
-  it('8 & 9. persists paired devices across server restarts and accepts stored token reconnects', async () => {
+  it('7. persists paired devices across restarts and revokes device tokens cleanly', async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     instance.close();
 
-    // Restart server against the same SQLite database
     instance = createNetFusionApp({ dbPath, startMonitor: false });
     const restarted = await startListening(instance);
     server = restarted.server;
     baseUrl = restarted.baseUrl;
 
-    // Re-authenticate admin after restart
     const loginRes = await fetch(`${baseUrl}/api/admin/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -261,14 +306,12 @@ describe('NetFusion real device detection, pairing, and heartbeat lifecycle', ()
     assert.equal(loginRes.status, 200);
     adminToken = ((await loginRes.json()) as { admin_token: string }).admin_token;
 
-    // Verify paired devices survived restart
     const listRes = await fetch(`${baseUrl}/api/clients`, {
       headers: { Authorization: `Bearer ${adminToken}` },
     });
     const listBody = (await listRes.json()) as { clients: Array<{ id: string }> };
     assert.equal(listBody.clients.length, 2);
 
-    // Previously paired Android device reconnects using its persisted auth_token
     const hbRes = await fetch(`${baseUrl}/api/clients/heartbeat`, {
       method: 'POST',
       headers: {
@@ -279,7 +322,6 @@ describe('NetFusion real device detection, pairing, and heartbeat lifecycle', ()
     });
     assert.equal(hbRes.status, 200);
 
-    // Revoking device removes it and invalidates its token
     const delRes = await fetch(`${baseUrl}/api/clients/${firstDeviceId}`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${adminToken}` },
@@ -295,5 +337,58 @@ describe('NetFusion real device detection, pairing, and heartbeat lifecycle', ()
       body: JSON.stringify({ ip_address: '192.168.1.43' }),
     });
     assert.equal(revokedHb.status, 401);
+  });
+
+  it('8. enforces brute-force rate limit (429), 401 auth checks, and LAN-only IP classification', async () => {
+    const unauthClients = await fetch(`${baseUrl}/api/clients`);
+    assert.equal(unauthClients.status, 401);
+
+    const unauthGen = await fetch(`${baseUrl}/api/pairing/generate`, { method: 'POST' });
+    assert.equal(unauthGen.status, 401);
+
+    // Verify LAN IP filter helper blocks public internet IPs while allowing local Wi-Fi ranges
+    assert.equal(isLocalOrLanAddress('127.0.0.1'), true);
+    assert.equal(isLocalOrLanAddress('192.168.1.42'), true);
+    assert.equal(isLocalOrLanAddress('10.0.0.15'), true);
+    assert.equal(isLocalOrLanAddress('172.16.4.2'), true);
+    assert.equal(isLocalOrLanAddress('8.8.8.8'), false);
+    assert.equal(isLocalOrLanAddress('203.0.113.10'), false);
+
+    // Test sliding rate limit on an isolated instance so loopback rate limiter doesn't lock out main suite
+    const rlDir = fs.mkdtempSync(path.join(os.tmpdir(), 'netfusion-rl-'));
+    const rlInstance = createNetFusionApp({ dbPath: path.join(rlDir, 'rl.db'), startMonitor: false });
+    const rlServer = await startListening(rlInstance);
+    try {
+      for (let i = 0; i < 5; i++) {
+        const res = await fetch(`${rlServer.baseUrl}/api/clients/pair`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            pairing_id: 'pc-guess',
+            secret: `NF-BAD0-000${i}-XXXX`,
+            device_name: 'BruteForce',
+            platform: 'android',
+          }),
+        });
+        assert.equal(res.status, 401);
+      }
+
+      const blockedRes = await fetch(`${rlServer.baseUrl}/api/clients/pair`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          pairing_id: 'pc-guess',
+          secret: 'NF-BAD0-0006-XXXX',
+          device_name: 'BruteForce',
+          platform: 'android',
+        }),
+      });
+      assert.equal(blockedRes.status, 429);
+      assert.ok(Number(blockedRes.headers.get('retry-after')) >= 1);
+    } finally {
+      await new Promise<void>((resolve) => rlServer.server.close(() => resolve()));
+      rlInstance.close();
+      fs.rmSync(rlDir, { recursive: true, force: true });
+    }
   });
 });

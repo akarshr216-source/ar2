@@ -10,8 +10,6 @@ import type {
   NetworkInterfaceRecord,
   NetworkMetricRecord,
   PairingStatusSummary,
-  QosRuleRecord,
-  StreamingProfileRecord,
   SystemEventRecord,
   UsageStatRecord,
 } from './types.ts';
@@ -28,8 +26,12 @@ CREATE TABLE IF NOT EXISTS devices (
   ip_address TEXT NOT NULL,
   token_hash TEXT NOT NULL,
   pairing_status TEXT NOT NULL DEFAULT 'paired' CHECK(pairing_status IN ('paired', 'pending', 'revoked')),
-  connection_status TEXT NOT NULL DEFAULT 'connected' CHECK(connection_status IN ('connected', 'disconnected')),
+  connection_status TEXT NOT NULL DEFAULT 'disconnected' CHECK(connection_status IN ('connected', 'disconnected')),
   app_version TEXT NOT NULL DEFAULT '1.0.0',
+  rx_bytes INTEGER,
+  tx_bytes INTEGER,
+  download_bps REAL,
+  upload_bps REAL,
   status TEXT NOT NULL DEFAULT 'paired',
   last_seen_at TEXT NOT NULL,
   created_at TEXT NOT NULL
@@ -61,7 +63,7 @@ CREATE TABLE IF NOT EXISTS interfaces (
   kind TEXT NOT NULL CHECK(kind IN ('ethernet', 'wifi', 'cellular_usb', 'hotspot', 'loopback')),
   ip_address TEXT NOT NULL,
   mac_address TEXT NOT NULL,
-  is_host_detected INTEGER NOT NULL DEFAULT 0,
+  is_host_detected INTEGER NOT NULL DEFAULT 1,
   enabled INTEGER NOT NULL DEFAULT 1,
   simulated_down INTEGER NOT NULL DEFAULT 0,
   weight INTEGER NOT NULL DEFAULT 50,
@@ -73,52 +75,20 @@ CREATE TABLE IF NOT EXISTS interfaces (
 CREATE TABLE IF NOT EXISTS network_metrics (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   interface_id TEXT NOT NULL,
-  download_mbps REAL NOT NULL,
-  upload_mbps REAL NOT NULL,
-  latency_ms REAL NOT NULL,
-  jitter_ms REAL NOT NULL,
-  packet_loss_pct REAL NOT NULL,
-  health_score REAL NOT NULL,
-  rx_bytes INTEGER NOT NULL DEFAULT 0,
-  tx_bytes INTEGER NOT NULL DEFAULT 0,
-  probe_source TEXT NOT NULL DEFAULT 'tcp_probe',
+  download_mbps REAL,
+  upload_mbps REAL,
+  latency_ms REAL,
+  jitter_ms REAL,
+  packet_loss_pct REAL,
+  health_score REAL,
+  rx_bytes INTEGER,
+  tx_bytes INTEGER,
+  probe_source TEXT NOT NULL DEFAULT 'os_nic',
   recorded_at TEXT NOT NULL,
   FOREIGN KEY(interface_id) REFERENCES interfaces(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_metrics_iface_time ON network_metrics(interface_id, recorded_at DESC);
-
-CREATE TABLE IF NOT EXISTS streaming_profiles (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  description TEXT NOT NULL,
-  realtime_priority INTEGER NOT NULL,
-  gaming_priority INTEGER NOT NULL,
-  video_priority INTEGER NOT NULL,
-  normal_priority INTEGER NOT NULL,
-  background_priority INTEGER NOT NULL,
-  is_active INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS qos_rules (
-  id TEXT PRIMARY KEY,
-  app_name TEXT NOT NULL,
-  match_pattern TEXT NOT NULL,
-  tier TEXT NOT NULL CHECK(tier IN ('P0', 'P1', 'P2', 'P3', 'P4')),
-  priority_weight INTEGER NOT NULL,
-  preferred_interface_id TEXT,
-  enabled INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS bonding_sessions (
-  id TEXT PRIMARY KEY,
-  relay_endpoint TEXT,
-  mode TEXT NOT NULL DEFAULT 'disabled',
-  active_paths INTEGER NOT NULL DEFAULT 0,
-  status TEXT NOT NULL DEFAULT 'disabled',
-  updated_at TEXT NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS usage_stats (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,8 +116,17 @@ CREATE TABLE IF NOT EXISTS system_events (
 );
 `;
 
-export function normalizePairingCode(raw: string): string {
+export function normalizePairingSecret(raw: string): string {
   return raw.toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+function readOsLinkOperState(ifaceName: string): boolean {
+  try {
+    const state = fs.readFileSync(`/sys/class/net/${path.basename(ifaceName)}/operstate`, 'utf8').trim();
+    return state === 'up' || state === 'unknown';
+  } catch {
+    return true;
+  }
 }
 
 export class NetFusionStore {
@@ -159,57 +138,113 @@ export class NetFusionStore {
     this.db = new DatabaseSync(resolved);
     this.db.exec(SCHEMA_SQL);
     this.migrateLegacySchema();
-    this.purgeExperimentalDevices();
+    this.purgeMockAndExperimentalData();
     this.seedDefaults();
     this.syncHostInterfaces();
   }
 
   private migrateLegacySchema(): void {
-    const cols = this.db.prepare(`PRAGMA table_info(devices)`).all() as Array<{ name: string }>;
-    const existing = new Set(cols.map((c) => c.name));
+    const deviceCols = this.db.prepare(`PRAGMA table_info(devices)`).all() as Array<{ name: string }>;
+    const existingDevice = new Set(deviceCols.map((c) => c.name));
 
-    if (!existing.has('device_model')) {
+    if (!existingDevice.has('device_model')) {
       this.db.exec(`ALTER TABLE devices ADD COLUMN device_model TEXT NOT NULL DEFAULT 'Unknown'`);
     }
-    if (!existing.has('pairing_status')) {
+    if (!existingDevice.has('pairing_status')) {
       this.db.exec(
         `ALTER TABLE devices ADD COLUMN pairing_status TEXT NOT NULL DEFAULT 'paired' CHECK(pairing_status IN ('paired', 'pending', 'revoked'))`,
       );
     }
-    if (!existing.has('connection_status')) {
+    if (!existingDevice.has('connection_status')) {
       this.db.exec(
-        `ALTER TABLE devices ADD COLUMN connection_status TEXT NOT NULL DEFAULT 'connected' CHECK(connection_status IN ('connected', 'disconnected'))`,
+        `ALTER TABLE devices ADD COLUMN connection_status TEXT NOT NULL DEFAULT 'disconnected' CHECK(connection_status IN ('connected', 'disconnected'))`,
       );
     }
-    if (!existing.has('app_version')) {
+    if (!existingDevice.has('app_version')) {
       this.db.exec(`ALTER TABLE devices ADD COLUMN app_version TEXT NOT NULL DEFAULT '1.0.0'`);
+    }
+    if (!existingDevice.has('rx_bytes')) {
+      this.db.exec(`ALTER TABLE devices ADD COLUMN rx_bytes INTEGER`);
+    }
+    if (!existingDevice.has('tx_bytes')) {
+      this.db.exec(`ALTER TABLE devices ADD COLUMN tx_bytes INTEGER`);
+    }
+    if (!existingDevice.has('download_bps')) {
+      this.db.exec(`ALTER TABLE devices ADD COLUMN download_bps REAL`);
+    }
+    if (!existingDevice.has('upload_bps')) {
+      this.db.exec(`ALTER TABLE devices ADD COLUMN upload_bps REAL`);
+    }
+
+    const metricCols = this.db.prepare(`PRAGMA table_info(network_metrics)`).all() as Array<{
+      name: string;
+      notnull: number;
+    }>;
+    const nullableMetricCols = new Set([
+      'download_mbps',
+      'upload_mbps',
+      'latency_ms',
+      'jitter_ms',
+      'packet_loss_pct',
+      'health_score',
+    ]);
+    const needsMetricMigration = metricCols.some((c) => nullableMetricCols.has(c.name) && c.notnull === 1);
+    if (needsMetricMigration) {
+      this.db.exec(`
+        BEGIN IMMEDIATE;
+        ALTER TABLE network_metrics RENAME TO network_metrics_legacy;
+        CREATE TABLE network_metrics (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          interface_id TEXT NOT NULL,
+          download_mbps REAL,
+          upload_mbps REAL,
+          latency_ms REAL,
+          jitter_ms REAL,
+          packet_loss_pct REAL,
+          health_score REAL,
+          rx_bytes INTEGER,
+          tx_bytes INTEGER,
+          probe_source TEXT NOT NULL DEFAULT 'os_nic',
+          recorded_at TEXT NOT NULL,
+          FOREIGN KEY(interface_id) REFERENCES interfaces(id) ON DELETE CASCADE
+        );
+        INSERT INTO network_metrics (id, interface_id, download_mbps, upload_mbps, latency_ms, jitter_ms, packet_loss_pct, health_score, rx_bytes, tx_bytes, probe_source, recorded_at)
+        SELECT id, interface_id, download_mbps, upload_mbps, latency_ms, jitter_ms, packet_loss_pct, health_score, rx_bytes, tx_bytes, probe_source, recorded_at
+        FROM network_metrics_legacy;
+        DROP TABLE network_metrics_legacy;
+        CREATE INDEX IF NOT EXISTS idx_metrics_iface_time ON network_metrics(interface_id, recorded_at DESC);
+        COMMIT;
+      `);
     }
   }
 
-  private purgeExperimentalDevices(): void {
-    // Remove previously seeded experimental/demo devices so only real paired devices appear
+  private purgeMockAndExperimentalData(): void {
+    // Remove legacy experimental devices and seeded mock WAN interfaces
     this.db.prepare(`DELETE FROM devices WHERE id IN ('dev-win-local', 'dev-pixel-9')`).run();
+    this.db.prepare(`DELETE FROM interfaces WHERE is_host_detected = 0 OR id IN ('wan-airtel', 'wan-jio', 'wan-wifi')`).run();
+    // Remove legacy simulated failover/mock WAN event messages
+    this.db
+      .prepare(
+        `DELETE FROM system_events WHERE category = 'failover' OR message LIKE '%Airtel%' OR message LIKE '%Jio%' OR message LIKE '%Mobile Hotspot%'`,
+      )
+      .run();
+    // Ensure old simulated_down flags are cleared
+    this.db.prepare(`UPDATE interfaces SET simulated_down = 0 WHERE simulated_down != 0`).run();
   }
 
   private seedDefaults(): void {
     const now = new Date().toISOString();
     const envTimeout = Number(process.env.NETFUSION_HEARTBEAT_TIMEOUT_SECONDS || 15);
-    const envTtl = Number(process.env.NETFUSION_PAIRING_CODE_TTL_SECONDS || 300);
+    const envTtl = Number(process.env.NETFUSION_PAIRING_CODE_TTL_SECONDS || 120);
 
     const defaultSettings: Record<string, string> = {
       theme: 'system',
-      gateway_mode: 'false',
       server_port: '8080',
       lan_only: 'true',
       auto_discovery: 'true',
       monitor_interval_seconds: '3',
       heartbeat_timeout_seconds: String(Number.isFinite(envTimeout) && envTimeout >= 5 ? envTimeout : 15),
-      pairing_code_ttl_seconds: String(Number.isFinite(envTtl) && envTtl >= 30 ? envTtl : 300),
-      automatic_failover: 'true',
-      load_balancing_enabled: 'true',
-      load_balancing_algorithm: 'weighted_health',
-      bonding_enabled: 'false',
-      relay_mode: 'optional',
+      pairing_code_ttl_seconds: String(Number.isFinite(envTtl) && envTtl >= 30 ? envTtl : 120),
     };
 
     const insertSetting = this.db.prepare(
@@ -219,176 +254,70 @@ export class NetFusionStore {
       insertSetting.run(key, val, now);
     }
 
-    const profileCount = this.db.prepare(`SELECT COUNT(*) as c FROM streaming_profiles`).get() as { c: number };
-    if (profileCount.c === 0) {
-      const insertProfile = this.db.prepare(
-        `INSERT INTO streaming_profiles (id, name, description, realtime_priority, gaming_priority, video_priority, normal_priority, background_priority, is_active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      );
-      insertProfile.run(
-        'automatic',
-        'Automatic Balanced',
-        'Prioritizes real-time calls and gaming while distributing video and normal traffic across healthy uplinks.',
-        100,
-        90,
-        70,
-        50,
-        30,
-        1,
-      );
-      insertProfile.run(
-        'gaming',
-        'Low-Latency Gaming',
-        'Pins P1 gaming flows to the lowest jitter and lowest RTT healthy uplink.',
-        95,
-        100,
-        60,
-        45,
-        20,
-        0,
-      );
-      insertProfile.run(
-        'streaming_4k',
-        '4K Media & Live Stream',
-        'Allocates highest sustained bandwidth uplinks to P2 video playback and live broadcasts.',
-        95,
-        80,
-        90,
-        50,
-        25,
-        0,
-      );
-      insertProfile.run(
-        'conferencing',
-        'Video Conferencing',
-        'Reserves primary stable uplink capacity for P0 interactive audio/video calls.',
-        100,
-        75,
-        65,
-        40,
-        15,
-        0,
-      );
-    }
-
-    const qosCount = this.db.prepare(`SELECT COUNT(*) as c FROM qos_rules`).get() as { c: number };
-    if (qosCount.c === 0) {
-      const insertRule = this.db.prepare(
-        `INSERT INTO qos_rules (id, app_name, match_pattern, tier, priority_weight, preferred_interface_id, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      );
-      insertRule.run('rule-meet', 'Google Meet / Zoom', 'webrtc,zoom,meet', 'P0', 100, 'wan-airtel', 1, now);
-      insertRule.run('rule-valorant', 'Online & Cloud Gaming', 'udp:27015,geforce,xbox', 'P1', 90, 'wan-airtel', 1, now);
-      insertRule.run('rule-youtube', 'YouTube / OTT 4K', 'youtube,netflix,twitch', 'P2', 70, 'wan-jio', 1, now);
-      insertRule.run('rule-browser', 'General Web Browsing', 'https:443', 'P3', 50, null, 1, now);
-      insertRule.run('rule-updates', 'OS & Steam Downloads', 'windowsupdate,steamcdn', 'P4', 30, 'wan-wifi', 1, now);
-    }
-
-    const ifaceCount = this.db.prepare(`SELECT COUNT(*) as c FROM interfaces`).get() as { c: number };
-    if (ifaceCount.c === 0) {
-      const insertIface = this.db.prepare(
-        `INSERT INTO interfaces (id, system_name, display_name, provider, kind, ip_address, mac_address, is_host_detected, enabled, simulated_down, weight, priority_order, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      );
-      insertIface.run(
-        'wan-airtel',
-        'Ethernet 2',
-        'Airtel Fiber Uplink',
-        'Airtel Broadband',
-        'ethernet',
-        '192.168.10.24',
-        '00:1B:44:11:3A:B7',
-        0,
-        1,
-        0,
-        85,
-        1,
-        'healthy',
-        now,
-      );
-      insertIface.run(
-        'wan-jio',
-        'USB RNDIS',
-        'Jio 5G USB Tether',
-        'Reliance Jio',
-        'cellular_usb',
-        '192.168.42.129',
-        '02:50:F2:84:19:0C',
-        0,
-        1,
-        0,
-        65,
-        2,
-        'healthy',
-        now,
-      );
-      insertIface.run(
-        'wan-wifi',
-        'Wi-Fi 6',
-        'Mobile Hotspot Wi-Fi',
-        'Airtel 5G Hotspot',
-        'wifi',
-        '172.20.10.4',
-        'A4:5E:60:C9:22:18',
-        0,
-        1,
-        0,
-        40,
-        3,
-        'healthy',
-        now,
-      );
-    }
-
-    const bondCount = this.db.prepare(`SELECT COUNT(*) as c FROM bonding_sessions`).get() as { c: number };
-    if (bondCount.c === 0) {
-      this.db
-        .prepare(`INSERT INTO bonding_sessions (id, relay_endpoint, mode, active_paths, status, updated_at) VALUES (?, ?, ?, ?, ?, ?)`)
-        .run('default', null, 'disabled', 0, 'disabled', now);
-    }
+    // Upgrade legacy 300s default to 120s (2-minute QR expiration requirement)
+    this.db
+      .prepare(`UPDATE app_settings SET value = '120', updated_at = ? WHERE key = 'pairing_code_ttl_seconds' AND value = '300'`)
+      .run(now);
 
     const eventCount = this.db.prepare(`SELECT COUNT(*) as c FROM system_events`).get() as { c: number };
     if (eventCount.c === 0) {
-      this.addSystemEvent('info', 'startup', 'NetFusion v0.1 monitoring engine initialized in safe Monitoring Mode.');
-      this.addSystemEvent('info', 'discovery', 'Scanned local host network adapters. Real device registry awaiting pairing.');
+      this.addSystemEvent('info', 'startup', 'NetFusion server initialized using real OS network interfaces.');
     }
   }
 
   public syncHostInterfaces(): void {
     const now = new Date().toISOString();
     const nets = os.networkInterfaces();
+    const seenIds = new Set<string>();
+
     const upsert = this.db.prepare(`
       INSERT INTO interfaces (id, system_name, display_name, provider, kind, ip_address, mac_address, is_host_detected, enabled, simulated_down, weight, priority_order, status, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, 0, ?, ?, 'healthy', ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, 0, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         ip_address = excluded.ip_address,
         mac_address = excluded.mac_address,
         is_host_detected = 1,
+        simulated_down = 0,
+        status = excluded.status,
         updated_at = excluded.updated_at
     `);
 
-    let order = 10;
+    let order = 1;
     for (const [name, addrs] of Object.entries(nets)) {
       if (!addrs || name === 'lo') continue;
       const ipv4 = addrs.find((a) => a.family === 'IPv4' && !a.internal);
       if (!ipv4) continue;
       const id = `host-${name.replace(/[^a-zA-Z0-9_-]/g, '')}`;
+      seenIds.add(id);
       const lower = name.toLowerCase();
       const kind: NetworkInterfaceRecord['kind'] =
-        lower.includes('wlan') || lower.includes('wi-fi')
+        lower.includes('wlan') || lower.includes('wi-fi') || lower.includes('wifi')
           ? 'wifi'
-          : lower.includes('usb') || lower.includes('rndis')
+          : lower.includes('usb') || lower.includes('rndis') || lower.includes('wwan')
             ? 'cellular_usb'
             : 'ethernet';
+      const osUp = readOsLinkOperState(name);
       upsert.run(
         id,
         name,
-        `Host Adapter (${name})`,
-        'Detected OS Interface',
+        name,
+        'Operating System Interface',
         kind,
         ipv4.address,
         ipv4.mac || '00:00:00:00:00:00',
-        75,
+        50,
         order++,
+        osUp ? 'healthy' : 'offline',
         now,
       );
+    }
+
+    // Remove OS interfaces that are no longer present in os.networkInterfaces()
+    const existingRows = this.db.prepare(`SELECT id FROM interfaces`).all() as Array<{ id: string }>;
+    for (const row of existingRows) {
+      if (!seenIds.has(row.id)) {
+        this.db.prepare(`DELETE FROM interfaces WHERE id = ?`).run(row.id);
+      }
     }
   }
 
@@ -418,7 +347,7 @@ export class NetFusionStore {
     if (info.changes === 0) {
       throw new Error('Administrator passcode is already configured.');
     }
-    this.addSystemEvent('info', 'security', 'Administrator access claimed for local NetFusion device management.');
+    this.addSystemEvent('info', 'security', 'Administrator password configured for device management.');
   }
 
   public verifyAdminPasscode(passcode: string): boolean {
@@ -438,26 +367,33 @@ export class NetFusionStore {
     return crypto.timingSafeEqual(derived, stored);
   }
 
-  // Temporary single-use pairing code management
+  // Cryptographically secure, single-use, 2-minute expiring QR pairing session
   public generatePairingCode(
     ttlSeconds?: number,
     platformHint: DevicePlatform | 'any' = 'any',
-  ): { pairing_code: string; expires_at: string; ttl_seconds: number; code_hint: string } {
+  ): {
+    pairing_id: string;
+    pairing_code: string;
+    secret: string;
+    expires_at: string;
+    ttl_seconds: number;
+    code_hint: string;
+  } {
     const settings = this.getSettings();
-    const ttl = Math.max(30, Math.min(900, ttlSeconds ?? settings.pairing_code_ttl_seconds));
+    const ttl = Math.max(30, Math.min(600, ttlSeconds ?? settings.pairing_code_ttl_seconds));
     const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const bytes = crypto.randomBytes(12);
     let raw = '';
-    const bytes = crypto.randomBytes(8);
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 12; i++) {
       raw += alphabet[bytes[i] % alphabet.length];
     }
-    const formattedCode = `NF-${raw.slice(0, 4)}-${raw.slice(4, 8)}`;
-    const normalized = normalizePairingCode(formattedCode);
+    const formattedCode = `NF-${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`;
+    const normalized = normalizePairingSecret(formattedCode);
     const codeHash = crypto.createHash('sha256').update(normalized).digest('hex');
-    const codeHint = `NF-****-**${raw.slice(6, 8)}`;
     const now = new Date();
     const expiresAt = new Date(now.getTime() + ttl * 1000).toISOString();
-    const id = `pc-${crypto.randomBytes(6).toString('hex')}`;
+    const id = `pc-${crypto.randomBytes(8).toString('hex')}`;
+    const codeHint = id;
 
     this.db
       .prepare(
@@ -465,8 +401,16 @@ export class NetFusionStore {
       )
       .run(id, codeHash, codeHint, platformHint, expiresAt, now.toISOString());
 
-    this.addSystemEvent('info', 'pairing', `Generated temporary single-use pairing code (${codeHint}, expires in ${ttl}s).`);
-    return { pairing_code: formattedCode, expires_at: expiresAt, ttl_seconds: ttl, code_hint: codeHint };
+    // Never log pairing secret or partial characters
+    this.addSystemEvent('info', 'pairing', `Created QR pairing session ${id} (expires in ${ttl}s).`);
+    return {
+      pairing_id: id,
+      pairing_code: formattedCode,
+      secret: formattedCode,
+      expires_at: expiresAt,
+      ttl_seconds: ttl,
+      code_hint: codeHint,
+    };
   }
 
   public getPairingStatus(): PairingStatusSummary {
@@ -475,8 +419,17 @@ export class NetFusionStore {
     const settings = this.getSettings();
 
     const activeCodes = this.db
-      .prepare(`SELECT code_hint, platform_hint, expires_at FROM pairing_codes WHERE used_at IS NULL AND expires_at > ? ORDER BY created_at DESC`)
-      .all(nowIso) as Array<{ code_hint: string; platform_hint: DevicePlatform | 'any'; expires_at: string }>;
+      .prepare(
+        `SELECT id, code_hint, platform_hint, expires_at
+         FROM pairing_codes WHERE used_at IS NULL AND expires_at > ?
+         ORDER BY created_at DESC`,
+      )
+      .all(nowIso) as Array<{
+      id: string;
+      code_hint: string;
+      platform_hint: DevicePlatform | 'any';
+      expires_at: string;
+    }>;
 
     const counts = this.db
       .prepare(
@@ -491,6 +444,7 @@ export class NetFusionStore {
     return {
       active_codes: activeCodes.length,
       latest_code_expires_at: activeCodes[0]?.expires_at ?? null,
+      latest_pairing_id: activeCodes[0]?.id ?? null,
       latest_code_hint: activeCodes[0]?.code_hint ?? null,
       platform_hint: activeCodes[0]?.platform_hint ?? null,
       registered_devices: counts.total ?? 0,
@@ -501,43 +455,73 @@ export class NetFusionStore {
   }
 
   public pairDeviceWithCode(input: {
+    pairing_id?: string;
     pairing_code: string;
     device_name: string;
     platform: DevicePlatform;
     device_model: string;
     ip_address: string;
     app_version: string;
-  }): { ok: true; device: DeviceRecord; auth_token: string } | { ok: false; reason: 'invalid' | 'expired' | 'used' | 'platform_mismatch' } {
-    const normalized = normalizePairingCode(input.pairing_code);
+  }):
+    | { ok: true; device: DeviceRecord; auth_token: string }
+    | { ok: false; reason: 'invalid' | 'expired' | 'used' | 'platform_mismatch' } {
+    const normalized = normalizePairingSecret(input.pairing_code);
     if (normalized.length < 6) {
       return { ok: false, reason: 'invalid' };
     }
-    const codeHash = crypto.createHash('sha256').update(normalized).digest('hex');
+    const providedHashHex = crypto.createHash('sha256').update(normalized).digest('hex');
     const nowIso = new Date().toISOString();
 
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const codeRow = this.db
-        .prepare(`SELECT id, platform_hint, expires_at, used_at FROM pairing_codes WHERE code_hash = ?`)
-        .get(codeHash) as
-        | { id: string; platform_hint: DevicePlatform | 'any'; expires_at: string; used_at: string | null }
-        | undefined;
+      const codeRow = input.pairing_id
+        ? (this.db
+            .prepare(`SELECT id, code_hash, platform_hint, expires_at, used_at FROM pairing_codes WHERE id = ?`)
+            .get(input.pairing_id) as
+            | {
+                id: string;
+                code_hash: string;
+                platform_hint: DevicePlatform | 'any';
+                expires_at: string;
+                used_at: string | null;
+              }
+            | undefined)
+        : (this.db
+            .prepare(`SELECT id, code_hash, platform_hint, expires_at, used_at FROM pairing_codes WHERE code_hash = ?`)
+            .get(providedHashHex) as
+            | {
+                id: string;
+                code_hash: string;
+                platform_hint: DevicePlatform | 'any';
+                expires_at: string;
+                used_at: string | null;
+              }
+            | undefined);
 
       if (!codeRow) {
         this.db.exec('ROLLBACK');
-        this.addSystemEvent('warning', 'pairing', `Rejected pairing attempt with invalid code from ${input.ip_address}.`);
+        this.addSystemEvent('warning', 'pairing', `Rejected pairing attempt with invalid QR/code from ${input.ip_address}.`);
+        return { ok: false, reason: 'invalid' };
+      }
+
+      // Constant-time verification against stored SHA-256 secret hash
+      const a = Buffer.from(codeRow.code_hash, 'hex');
+      const b = Buffer.from(providedHashHex, 'hex');
+      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+        this.db.exec('ROLLBACK');
+        this.addSystemEvent('warning', 'pairing', `Rejected pairing attempt with mismatched secret from ${input.ip_address}.`);
         return { ok: false, reason: 'invalid' };
       }
 
       if (codeRow.used_at !== null) {
         this.db.exec('ROLLBACK');
-        this.addSystemEvent('warning', 'pairing', `Rejected reuse of already-consumed pairing code from ${input.ip_address}.`);
+        this.addSystemEvent('warning', 'pairing', `Rejected reuse of already-used pairing session ${codeRow.id}.`);
         return { ok: false, reason: 'used' };
       }
 
       if (Date.parse(codeRow.expires_at) <= Date.now()) {
         this.db.exec('ROLLBACK');
-        this.addSystemEvent('warning', 'pairing', `Rejected expired pairing code from ${input.ip_address}.`);
+        this.addSystemEvent('warning', 'pairing', `Rejected expired pairing session ${codeRow.id}.`);
         return { ok: false, reason: 'expired' };
       }
 
@@ -559,10 +543,11 @@ export class NetFusionStore {
         return { ok: false, reason: 'used' };
       }
 
+      // Pairing and live connectivity are separate: starts 'disconnected' until first live heartbeat arrives
       this.db
         .prepare(
-          `INSERT INTO devices (id, name, platform, device_model, ip_address, token_hash, pairing_status, connection_status, app_version, status, last_seen_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'paired', 'connected', ?, 'paired', ?, ?)`,
+          `INSERT INTO devices (id, name, platform, device_model, ip_address, token_hash, pairing_status, connection_status, app_version, rx_bytes, tx_bytes, download_bps, upload_bps, status, last_seen_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'paired', 'disconnected', ?, NULL, NULL, NULL, NULL, 'paired', ?, ?)`,
         )
         .run(
           id,
@@ -580,7 +565,7 @@ export class NetFusionStore {
 
       const device = this.db
         .prepare(
-          `SELECT id, name, platform, device_model, ip_address, pairing_status, connection_status, app_version, last_seen_at, created_at FROM devices WHERE id = ?`,
+          `SELECT id, name, platform, device_model, ip_address, pairing_status, connection_status, app_version, rx_bytes, tx_bytes, download_bps, upload_bps, last_seen_at, created_at FROM devices WHERE id = ?`,
         )
         .get(id) as unknown as DeviceRecord;
 
@@ -594,7 +579,7 @@ export class NetFusionStore {
       try {
         this.db.exec('ROLLBACK');
       } catch {
-        // Ignore rollback error
+        // Ignore rollback failure
       }
       throw err;
     }
@@ -602,13 +587,21 @@ export class NetFusionStore {
 
   public recordDeviceHeartbeat(
     bearerToken: string,
-    patch: { ip_address?: string; app_version?: string; device_model?: string },
+    patch: {
+      ip_address?: string;
+      app_version?: string;
+      device_model?: string;
+      rx_bytes?: number | null;
+      tx_bytes?: number | null;
+      download_bps?: number | null;
+      upload_bps?: number | null;
+    },
   ): DeviceRecord | null {
     if (!bearerToken.startsWith('nf_dev_')) return null;
     const tokenHash = crypto.createHash('sha256').update(bearerToken).digest('hex');
     const existing = this.db
       .prepare(
-        `SELECT id, name, platform, device_model, ip_address, pairing_status, connection_status, app_version, last_seen_at, created_at
+        `SELECT id, name, platform, device_model, ip_address, pairing_status, connection_status, app_version, rx_bytes, tx_bytes, download_bps, upload_bps, last_seen_at, created_at
          FROM devices WHERE token_hash = ? AND pairing_status = 'paired'`,
       )
       .get(tokenHash) as unknown as DeviceRecord | undefined;
@@ -619,20 +612,28 @@ export class NetFusionStore {
     const nextIp = patch.ip_address || existing.ip_address;
     const nextVersion = patch.app_version || existing.app_version;
     const nextModel = patch.device_model || existing.device_model;
+    const nextRx = patch.rx_bytes !== undefined ? patch.rx_bytes : existing.rx_bytes;
+    const nextTx = patch.tx_bytes !== undefined ? patch.tx_bytes : existing.tx_bytes;
+    const nextDownBps = patch.download_bps !== undefined ? patch.download_bps : existing.download_bps;
+    const nextUpBps = patch.upload_bps !== undefined ? patch.upload_bps : existing.upload_bps;
 
     this.db
       .prepare(
-        `UPDATE devices SET connection_status = 'connected', last_seen_at = ?, ip_address = ?, app_version = ?, device_model = ? WHERE id = ?`,
+        `UPDATE devices
+         SET connection_status = 'connected', last_seen_at = ?, ip_address = ?, app_version = ?, device_model = ?,
+             rx_bytes = ?, tx_bytes = ?, download_bps = ?, upload_bps = ?
+         WHERE id = ?`,
       )
-      .run(nowIso, nextIp, nextVersion, nextModel, existing.id);
+      .run(nowIso, nextIp, nextVersion, nextModel, nextRx, nextTx, nextDownBps, nextUpBps, existing.id);
 
     if (existing.connection_status === 'disconnected') {
-      this.addSystemEvent('info', 'device', `${existing.name} (${existing.platform}) reconnected at ${nextIp}.`);
+      this.addSystemEvent('info', 'device', `${existing.name} (${existing.platform}) connected at ${nextIp}.`);
     }
 
     return this.db
       .prepare(
-        `SELECT id, name, platform, device_model, ip_address, pairing_status, connection_status, app_version, last_seen_at, created_at FROM devices WHERE id = ?`,
+        `SELECT id, name, platform, device_model, ip_address, pairing_status, connection_status, app_version, rx_bytes, tx_bytes, download_bps, upload_bps, last_seen_at, created_at
+         FROM devices WHERE id = ?`,
       )
       .get(existing.id) as unknown as DeviceRecord;
   }
@@ -666,7 +667,7 @@ export class NetFusionStore {
     this.evaluateDeviceHeartbeats();
     return this.db
       .prepare(
-        `SELECT id, name, platform, device_model, ip_address, pairing_status, connection_status, app_version, last_seen_at, created_at
+        `SELECT id, name, platform, device_model, ip_address, pairing_status, connection_status, app_version, rx_bytes, tx_bytes, download_bps, upload_bps, last_seen_at, created_at
          FROM devices ORDER BY CASE WHEN connection_status = 'connected' THEN 0 ELSE 1 END, last_seen_at DESC`,
       )
       .all() as unknown as DeviceRecord[];
@@ -695,7 +696,7 @@ export class NetFusionStore {
       | undefined;
     if (!existing) return false;
     this.db.prepare(`DELETE FROM devices WHERE id = ?`).run(id);
-    this.addSystemEvent('warning', 'pairing', `Unpaired and removed ${existing.platform} device "${existing.name}".`);
+    this.addSystemEvent('warning', 'pairing', `Removed ${existing.platform} device "${existing.name}".`);
     return true;
   }
 
@@ -713,19 +714,12 @@ export class NetFusionStore {
     const map = new Map(rows.map((r) => [r.key, r.value]));
     return {
       theme: (map.get('theme') as NetFusionSettings['theme']) || 'system',
-      gateway_mode: map.get('gateway_mode') === 'true',
       server_port: Number(map.get('server_port') || 8080),
       lan_only: map.get('lan_only') !== 'false',
       auto_discovery: map.get('auto_discovery') !== 'false',
       monitor_interval_seconds: Math.max(1, Math.min(60, Number(map.get('monitor_interval_seconds') || 3))),
       heartbeat_timeout_seconds: Math.max(5, Math.min(300, Number(map.get('heartbeat_timeout_seconds') || 15))),
-      pairing_code_ttl_seconds: Math.max(30, Math.min(900, Number(map.get('pairing_code_ttl_seconds') || 300))),
-      automatic_failover: map.get('automatic_failover') !== 'false',
-      load_balancing_enabled: map.get('load_balancing_enabled') !== 'false',
-      load_balancing_algorithm:
-        (map.get('load_balancing_algorithm') as NetFusionSettings['load_balancing_algorithm']) || 'weighted_health',
-      bonding_enabled: map.get('bonding_enabled') === 'true',
-      relay_mode: map.get('relay_mode') || 'optional',
+      pairing_code_ttl_seconds: Math.max(30, Math.min(600, Number(map.get('pairing_code_ttl_seconds') || 120))),
     };
   }
 
@@ -744,35 +738,26 @@ export class NetFusionStore {
 
   public getInterfaces(): NetworkInterfaceRecord[] {
     return this.db
-      .prepare(`SELECT * FROM interfaces ORDER BY is_host_detected DESC, priority_order ASC, display_name ASC`)
+      .prepare(
+        `SELECT id, system_name, display_name, provider, kind, ip_address, mac_address, is_host_detected, enabled, weight, priority_order, status, updated_at
+         FROM interfaces ORDER BY priority_order ASC, display_name ASC`,
+      )
       .all() as unknown as NetworkInterfaceRecord[];
   }
 
   public getInterfaceById(id: string): NetworkInterfaceRecord | undefined {
-    return this.db.prepare(`SELECT * FROM interfaces WHERE id = ?`).get(id) as unknown as
-      | NetworkInterfaceRecord
-      | undefined;
+    return this.db
+      .prepare(
+        `SELECT id, system_name, display_name, provider, kind, ip_address, mac_address, is_host_detected, enabled, weight, priority_order, status, updated_at
+         FROM interfaces WHERE id = ?`,
+      )
+      .get(id) as unknown as NetworkInterfaceRecord | undefined;
   }
 
-  public updateInterface(
-    id: string,
-    patch: Partial<Pick<NetworkInterfaceRecord, 'enabled' | 'simulated_down' | 'weight' | 'priority_order' | 'status'>>,
-  ): NetworkInterfaceRecord | undefined {
-    const current = this.getInterfaceById(id);
-    if (!current) return undefined;
-    const now = new Date().toISOString();
-    const nextEnabled = patch.enabled !== undefined ? patch.enabled : current.enabled;
-    const nextSimDown = patch.simulated_down !== undefined ? patch.simulated_down : current.simulated_down;
-    const nextWeight = patch.weight !== undefined ? patch.weight : current.weight;
-    const nextPriority = patch.priority_order !== undefined ? patch.priority_order : current.priority_order;
-    const nextStatus = patch.status !== undefined ? patch.status : current.status;
-
+  public updateInterfaceStatus(id: string, status: NetworkInterfaceRecord['status']): void {
     this.db
-      .prepare(
-        `UPDATE interfaces SET enabled = ?, simulated_down = ?, weight = ?, priority_order = ?, status = ?, updated_at = ? WHERE id = ?`,
-      )
-      .run(nextEnabled, nextSimDown, nextWeight, nextPriority, nextStatus, now, id);
-    return this.getInterfaceById(id);
+      .prepare(`UPDATE interfaces SET status = ?, updated_at = ? WHERE id = ?`)
+      .run(status, new Date().toISOString(), id);
   }
 
   public insertMetric(metric: NetworkMetricRecord): void {
@@ -796,23 +781,25 @@ export class NetFusionStore {
 
     this.db
       .prepare(
-        `DELETE FROM network_metrics WHERE interface_id = ? AND id NOT IN (SELECT id FROM network_metrics WHERE interface_id = ? ORDER BY id DESC LIMIT 400)`,
+        `DELETE FROM network_metrics WHERE interface_id = ? AND id NOT IN (SELECT id FROM network_metrics WHERE interface_id = ? ORDER BY id DESC LIMIT 200)`,
       )
       .run(metric.interface_id, metric.interface_id);
 
-    const dateKey = metric.recorded_at.slice(0, 10);
-    const intervalSec = this.getSettings().monitor_interval_seconds;
-    const rxMbDelta = (metric.download_mbps * intervalSec) / 8;
-    const txMbDelta = (metric.upload_mbps * intervalSec) / 8;
-    this.db
-      .prepare(
-        `INSERT INTO usage_stats (interface_id, date_key, rx_mb, tx_mb, updated_at) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(interface_id, date_key) DO UPDATE SET
-           rx_mb = rx_mb + excluded.rx_mb,
-           tx_mb = tx_mb + excluded.tx_mb,
-           updated_at = excluded.updated_at`,
-      )
-      .run(metric.interface_id, dateKey, rxMbDelta, txMbDelta, metric.recorded_at);
+    if (metric.download_mbps !== null && metric.upload_mbps !== null) {
+      const dateKey = metric.recorded_at.slice(0, 10);
+      const intervalSec = this.getSettings().monitor_interval_seconds;
+      const rxMbDelta = (metric.download_mbps * intervalSec) / 8;
+      const txMbDelta = (metric.upload_mbps * intervalSec) / 8;
+      this.db
+        .prepare(
+          `INSERT INTO usage_stats (interface_id, date_key, rx_mb, tx_mb, updated_at) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(interface_id, date_key) DO UPDATE SET
+             rx_mb = rx_mb + excluded.rx_mb,
+             tx_mb = tx_mb + excluded.tx_mb,
+             updated_at = excluded.updated_at`,
+        )
+        .run(metric.interface_id, dateKey, rxMbDelta, txMbDelta, metric.recorded_at);
+    }
   }
 
   public getLatestMetricPerInterface(): Map<string, NetworkMetricRecord> {
@@ -823,84 +810,16 @@ export class NetFusionStore {
            SELECT interface_id, MAX(id) AS max_id FROM network_metrics GROUP BY interface_id
          ) latest ON m.id = latest.max_id`,
       )
-      .all() as unknown as NetworkMetricRecord[];
-    return new Map(rows.map((r) => [r.interface_id, r]));
-  }
-
-  public getMetricHistory(limitPerInterface = 30): NetworkMetricRecord[] {
-    return this.db
-      .prepare(
-        `SELECT * FROM (
-           SELECT *, ROW_NUMBER() OVER (PARTITION BY interface_id ORDER BY id DESC) AS rn
-           FROM network_metrics
-         ) WHERE rn <= ? ORDER BY id ASC`,
-      )
-      .all(limitPerInterface) as unknown as NetworkMetricRecord[];
-  }
-
-  public getStreamingProfiles(): StreamingProfileRecord[] {
-    return this.db.prepare(`SELECT * FROM streaming_profiles ORDER BY is_active DESC, name ASC`).all() as unknown as StreamingProfileRecord[];
-  }
-
-  public activateStreamingProfile(profileId: string): StreamingProfileRecord[] {
-    const exists = this.db.prepare(`SELECT id, name FROM streaming_profiles WHERE id = ?`).get(profileId) as
-      | { id: string; name: string }
-      | undefined;
-    if (!exists) {
-      throw new Error('Streaming profile not found');
-    }
-    this.db.prepare(`UPDATE streaming_profiles SET is_active = 0`).run();
-    this.db.prepare(`UPDATE streaming_profiles SET is_active = 1 WHERE id = ?`).run(profileId);
-    this.addSystemEvent('info', 'streaming', `Activated streaming priority profile "${exists.name}".`);
-    return this.getStreamingProfiles();
-  }
-
-  public getQosRules(): QosRuleRecord[] {
-    return this.db
-      .prepare(`SELECT * FROM qos_rules ORDER BY priority_weight DESC, created_at ASC`)
-      .all() as unknown as QosRuleRecord[];
-  }
-
-  public createQosRule(input: {
-    app_name: string;
-    match_pattern: string;
-    tier: QosRuleRecord['tier'];
-    preferred_interface_id: string | null;
-  }): QosRuleRecord {
-    const weights: Record<QosRuleRecord['tier'], number> = {
-      P0: 100,
-      P1: 90,
-      P2: 70,
-      P3: 50,
-      P4: 30,
-    };
-    const id = `rule-${crypto.randomBytes(5).toString('hex')}`;
-    const now = new Date().toISOString();
-    const weight = weights[input.tier];
-
-    this.db
-      .prepare(
-        `INSERT INTO qos_rules (id, app_name, match_pattern, tier, priority_weight, preferred_interface_id, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
-      )
-      .run(id, input.app_name, input.match_pattern, input.tier, weight, input.preferred_interface_id, now);
-
-    this.addSystemEvent('info', 'qos', `Added ${input.tier} (${weight}/100) traffic rule for ${input.app_name}.`);
-    return this.db.prepare(`SELECT * FROM qos_rules WHERE id = ?`).get(id) as unknown as QosRuleRecord;
-  }
-
-  public toggleQosRule(id: string, enabled: boolean): QosRuleRecord | undefined {
-    const existing = this.db.prepare(`SELECT * FROM qos_rules WHERE id = ?`).get(id) as unknown as QosRuleRecord | undefined;
-    if (!existing) return undefined;
-    this.db.prepare(`UPDATE qos_rules SET enabled = ? WHERE id = ?`).run(enabled ? 1 : 0, id);
-    return this.db.prepare(`SELECT * FROM qos_rules WHERE id = ?`).get(id) as unknown as QosRuleRecord;
-  }
-
-  public deleteQosRule(id: string): boolean {
-    const existing = this.db.prepare(`SELECT app_name FROM qos_rules WHERE id = ?`).get(id) as { app_name: string } | undefined;
-    if (!existing) return false;
-    this.db.prepare(`DELETE FROM qos_rules WHERE id = ?`).run(id);
-    this.addSystemEvent('info', 'qos', `Removed QoS rule for ${existing.app_name}.`);
-    return true;
+      .all() as unknown as Array<Omit<NetworkMetricRecord, 'metrics_available'>>;
+    return new Map(
+      rows.map((r) => [
+        r.interface_id,
+        {
+          ...r,
+          metrics_available: r.download_mbps !== null && r.upload_mbps !== null,
+        },
+      ]),
+    );
   }
 
   public getUsageStats(): UsageStatRecord[] {

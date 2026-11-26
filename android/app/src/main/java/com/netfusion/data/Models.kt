@@ -5,7 +5,9 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 data class PairRequest(
-    @SerialName("pairing_code") val pairingCode: String,
+    @SerialName("pairing_id") val pairingId: String? = null,
+    val secret: String,
+    @SerialName("pairing_code") val pairingCode: String = secret,
     @SerialName("device_name") val deviceName: String,
     val platform: String = "android",
     @SerialName("device_model") val deviceModel: String,
@@ -23,6 +25,10 @@ data class RegisteredDevice(
     @SerialName("pairing_status") val pairingStatus: String,
     @SerialName("connection_status") val connectionStatus: String,
     @SerialName("app_version") val appVersion: String,
+    @SerialName("rx_bytes") val rxBytes: Long? = null,
+    @SerialName("tx_bytes") val txBytes: Long? = null,
+    @SerialName("download_bps") val downloadBps: Double? = null,
+    @SerialName("upload_bps") val uploadBps: Double? = null,
     @SerialName("last_seen_at") val lastSeenAt: String,
     @SerialName("created_at") val createdAt: String,
 )
@@ -39,12 +45,29 @@ data class HeartbeatRequest(
     @SerialName("ip_address") val ipAddress: String,
     @SerialName("app_version") val appVersion: String,
     @SerialName("device_model") val deviceModel: String,
+    @SerialName("rx_bytes") val rxBytes: Long? = null,
+    @SerialName("tx_bytes") val txBytes: Long? = null,
+    @SerialName("download_bps") val downloadBps: Double? = null,
+    @SerialName("upload_bps") val uploadBps: Double? = null,
 )
 
 @Serializable
 data class HeartbeatResponse(
     val status: String,
     val device: RegisteredDevice,
+)
+
+@Serializable
+data class ApiErrorResponse(
+    val error: String? = null,
+    val reason: String? = null,
+)
+
+data class ParsedQrPairing(
+    val serverUrl: String,
+    val pairingId: String,
+    val secret: String,
+    val isTrustedLocalNetwork: Boolean,
 )
 
 enum class ClientConnectionState {

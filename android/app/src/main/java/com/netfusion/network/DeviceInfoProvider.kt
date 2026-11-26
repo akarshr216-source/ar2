@@ -3,9 +3,16 @@ package com.netfusion.network
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.TrafficStats
 import android.os.Build
 import com.netfusion.BuildConfig
 import java.net.Inet4Address
+
+data class TrafficCounterSample(
+    val rxBytes: Long,
+    val txBytes: Long,
+    val timestampMs: Long,
+)
 
 class DeviceInfoProvider(private val context: Context) {
 
@@ -20,6 +27,19 @@ class DeviceInfoProvider(private val context: Context) {
     }
 
     fun getAppVersion(): String = BuildConfig.VERSION_NAME
+
+    fun readTrafficCounters(): TrafficCounterSample? {
+        val rx = TrafficStats.getTotalRxBytes()
+        val tx = TrafficStats.getTotalTxBytes()
+        if (rx == TrafficStats.UNSUPPORTED.toLong() || tx == TrafficStats.UNSUPPORTED.toLong()) {
+            return null
+        }
+        return TrafficCounterSample(
+            rxBytes = rx,
+            txBytes = tx,
+            timestampMs = System.currentTimeMillis(),
+        )
+    }
 
     fun getLocalWifiIpAddress(): String {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager

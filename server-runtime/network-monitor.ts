@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import net from 'node:net';
+import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import type { NetFusionStore } from './db.ts';
 import type { InterfaceWithMetrics, NetworkInterfaceRecord, NetworkMetricRecord } from './types.ts';
@@ -16,14 +17,18 @@ export class NetworkMonitor {
   private timer: NodeJS.Timeout | null = null;
   private listeners = new Set<(snapshot: TelemetrySnapshot) => void>();
   private prevProcCounters = new Map<string, { rxBytes: number; txBytes: number; ts: number }>();
-  private prevLatency = new Map<string, number>();
+  private prevLatency: number | null = null;
+  private lastProbeLatencyMs: number | null = null;
+  private recentProbeResults: boolean[] = [];
 
   constructor(store: NetFusionStore) {
     this.store = store;
   }
 
   public start(): void {
-    void this.runCycle();
+    void this.runCycle().catch((err) => {
+      console.warn('Initial network monitor cycle error:', err instanceof Error ? err.message : err);
+    });
     this.scheduleNext();
   }
 
@@ -35,10 +40,21 @@ export class NetworkMonitor {
     this.scheduleNext();
   }
 
+  public stop(): void {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+
   private scheduleNext(): void {
     const intervalMs = this.store.getSettings().monitor_interval_seconds * 1000;
     this.timer = setTimeout(async () => {
-      await this.runCycle();
+      try {
+        await this.runCycle();
+      } catch (err) {
+        console.warn('Network monitor cycle error:', err instanceof Error ? err.message : err);
+      }
       this.scheduleNext();
     }, intervalMs);
   }
@@ -90,9 +106,18 @@ export class NetworkMonitor {
         }
       }
     } catch {
-      // Non-Linux environment fallback
+      // Non-Linux host where /proc/net/dev is unavailable
     }
     return map;
+  }
+
+  private isOsLinkUp(systemName: string): boolean {
+    try {
+      const state = fs.readFileSync(`/sys/class/net/${path.basename(systemName)}/operstate`, 'utf8').trim();
+      return state === 'up' || state === 'unknown';
+    } catch {
+      return true;
+    }
   }
 
   public notifyDeviceChange(): void {
@@ -105,73 +130,45 @@ export class NetworkMonitor {
   public async runCycle(): Promise<TelemetrySnapshot> {
     this.store.syncHostInterfaces();
     this.store.evaluateDeviceHeartbeats();
+
     const interfaces = this.store.getInterfaces();
     const procMap = this.readProcNetDev();
-    const realTcpMs = await this.probeHostTcp('1.1.1.1', 443);
+    let realTcpMs = await this.probeHostTcp('1.1.1.1', 443);
+    if (realTcpMs === null) {
+      realTcpMs = await this.probeHostTcp('8.8.8.8', 443);
+    }
+
+    this.lastProbeLatencyMs = realTcpMs;
+    this.recentProbeResults.push(realTcpMs !== null);
+    if (this.recentProbeResults.length > 10) {
+      this.recentProbeResults.shift();
+    }
+
+    const failedProbes = this.recentProbeResults.filter((ok) => !ok).length;
+    const realLossPct =
+      this.recentProbeResults.length > 0
+        ? Number(((failedProbes / this.recentProbeResults.length) * 100).toFixed(1))
+        : null;
+
+    let jitterMs: number | null = null;
+    if (realTcpMs !== null) {
+      jitterMs =
+        this.prevLatency !== null
+          ? Number(Math.min(100, Math.abs(realTcpMs - this.prevLatency) * 0.35).toFixed(2))
+          : 0;
+      this.prevLatency = realTcpMs;
+    }
+
     const nowIso = new Date().toISOString();
     const nowTs = Date.now();
 
     for (const iface of interfaces) {
-      const metric = this.buildMetricForInterface(iface, procMap, realTcpMs, nowIso, nowTs);
-      this.store.insertMetric(metric);
-
-      const nextStatus: NetworkInterfaceRecord['status'] = !iface.enabled
-        ? 'disabled'
-        : iface.simulated_down || metric.packet_loss_pct >= 50
-          ? 'offline'
-          : metric.latency_ms > 90 || metric.packet_loss_pct > 2.5
-            ? 'degraded'
-            : 'healthy';
-
-      if (nextStatus !== iface.status) {
-        this.store.updateInterface(iface.id, { status: nextStatus });
-        if (nextStatus === 'offline' || nextStatus === 'degraded') {
-          this.store.addSystemEvent(
-            nextStatus === 'offline' ? 'error' : 'warning',
-            'failover',
-            `${iface.display_name} transitioned to ${nextStatus}; scheduler rebalanced active flows.`,
-          );
-        } else if (iface.status === 'offline' && nextStatus === 'healthy') {
-          this.store.addSystemEvent('info', 'recovery', `${iface.display_name} recovered and rejoined load balancing pool.`);
-        }
-      }
-    }
-
-    const snapshot = this.getSnapshot();
-    for (const listener of this.listeners) {
-      listener(snapshot);
-    }
-    return snapshot;
-  }
-
-  private buildMetricForInterface(
-    iface: NetworkInterfaceRecord,
-    procMap: Map<string, ProcNetCounters>,
-    realTcpMs: number | null,
-    nowIso: string,
-    nowTs: number,
-  ): NetworkMetricRecord {
-    if (!iface.enabled || iface.simulated_down) {
-      return {
-        interface_id: iface.id,
-        download_mbps: 0,
-        upload_mbps: 0,
-        latency_ms: 0,
-        jitter_ms: 0,
-        packet_loss_pct: iface.simulated_down ? 100 : 0,
-        health_score: 0,
-        rx_bytes: 0,
-        tx_bytes: 0,
-        probe_source: iface.simulated_down ? 'failover_test' : 'disabled',
-        recorded_at: nowIso,
-      };
-    }
-
-    if (iface.is_host_detected) {
+      const linkUp = this.isOsLinkUp(iface.system_name);
       const counters = procMap.get(iface.system_name);
       const prev = this.prevProcCounters.get(iface.id);
-      let downMbps = 0.4;
-      let upMbps = 0.15;
+
+      let downMbps: number | null = null;
+      let upMbps: number | null = null;
       if (counters && prev) {
         const dtSec = Math.max(0.5, (nowTs - prev.ts) / 1000);
         const rxDelta = Math.max(0, counters.rxBytes - prev.rxBytes);
@@ -183,76 +180,37 @@ export class NetworkMonitor {
         this.prevProcCounters.set(iface.id, { rxBytes: counters.rxBytes, txBytes: counters.txBytes, ts: nowTs });
       }
 
-      const latency = realTcpMs !== null ? realTcpMs : 14.5;
-      const lastLat = this.prevLatency.get(iface.id) ?? latency;
-      const instantDelta = Math.abs(latency - lastLat);
-      const jitter = Number(Math.min(50, instantDelta * 0.35).toFixed(2));
-      this.prevLatency.set(iface.id, latency);
-      const loss = realTcpMs !== null ? 0 : 100;
-      const health = realTcpMs !== null ? Math.max(55, Math.min(99.5, Number((100 - latency * 0.25 - jitter * 0.5).toFixed(1)))) : 0;
-
-      return {
+      const metric: NetworkMetricRecord = {
         interface_id: iface.id,
-        download_mbps: Math.max(0.05, downMbps),
-        upload_mbps: Math.max(0.02, upMbps),
-        latency_ms: latency,
-        jitter_ms: jitter,
-        packet_loss_pct: loss,
-        health_score: health,
-        rx_bytes: counters?.rxBytes ?? 0,
-        tx_bytes: counters?.txBytes ?? 0,
-        probe_source: realTcpMs !== null ? 'os_nic_tcp_probe' : 'os_nic_offline',
+        download_mbps: linkUp ? downMbps : 0,
+        upload_mbps: linkUp ? upMbps : 0,
+        latency_ms: linkUp ? realTcpMs : null,
+        jitter_ms: linkUp ? jitterMs : null,
+        packet_loss_pct: linkUp ? realLossPct : 100,
+        health_score: null,
+        rx_bytes: counters ? counters.rxBytes : null,
+        tx_bytes: counters ? counters.txBytes : null,
+        metrics_available: Boolean(counters && prev),
+        probe_source: counters ? 'os_proc_net_dev' : 'os_adapter_only',
         recorded_at: nowIso,
       };
+      this.store.insertMetric(metric);
+
+      const nextStatus: NetworkInterfaceRecord['status'] = !linkUp
+        ? 'offline'
+        : realTcpMs === null
+          ? 'degraded'
+          : 'healthy';
+      if (nextStatus !== iface.status) {
+        this.store.updateInterfaceStatus(iface.id, nextStatus);
+      }
     }
 
-    // Upstream WAN profiles anchored to live TCP reachability
-    const baseTcp = realTcpMs ?? 12;
-    const t = nowTs / 1000;
-    const wave = Math.sin(t * 0.7 + iface.priority_order * 1.9);
-    const wave2 = Math.cos(t * 0.45 + iface.priority_order * 0.8);
-
-    let baseDown = 142;
-    let baseUp = 48;
-    let extraLat = 9;
-    let jitterBase = 1.4;
-    let loss = 0;
-
-    if (iface.kind === 'cellular_usb') {
-      baseDown = 86;
-      baseUp = 18;
-      extraLat = 24;
-      jitterBase = 4.2;
-      loss = wave > 0.85 ? 0.4 : 0;
-    } else if (iface.kind === 'wifi') {
-      baseDown = 44;
-      baseUp = 11;
-      extraLat = 31;
-      jitterBase = 5.6;
-      loss = wave2 > 0.82 ? 0.8 : 0.1;
+    const snapshot = this.getSnapshot();
+    for (const listener of this.listeners) {
+      listener(snapshot);
     }
-
-    const downloadMbps = Number(Math.max(2, baseDown + wave * (baseDown * 0.14)).toFixed(1));
-    const uploadMbps = Number(Math.max(1, baseUp + wave2 * (baseUp * 0.16)).toFixed(1));
-    const latencyMs = Number(Math.max(4, baseTcp + extraLat + wave * 3.1).toFixed(1));
-    const jitterMs = Number(Math.max(0.3, jitterBase + Math.abs(wave2) * 1.6).toFixed(1));
-    const healthScore = Number(
-      Math.max(10, Math.min(99, 100 - latencyMs * 0.35 - jitterMs * 1.8 - loss * 12)).toFixed(1),
-    );
-
-    return {
-      interface_id: iface.id,
-      download_mbps: downloadMbps,
-      upload_mbps: uploadMbps,
-      latency_ms: latencyMs,
-      jitter_ms: jitterMs,
-      packet_loss_pct: loss,
-      health_score: healthScore,
-      rx_bytes: Math.round((downloadMbps * 1_000_000) / 8),
-      tx_bytes: Math.round((uploadMbps * 1_000_000) / 8),
-      probe_source: realTcpMs !== null ? 'wan_probe_calibrated' : 'wan_probe_fallback',
-      recorded_at: nowIso,
-    };
+    return snapshot;
   }
 
   public getSnapshot(): TelemetrySnapshot {
@@ -260,44 +218,50 @@ export class NetworkMonitor {
     const interfaces = this.store.getInterfaces();
     const latestMap = this.store.getLatestMetricPerInterface();
 
-    const activePool = interfaces.filter((i) => i.enabled && !i.simulated_down && i.status !== 'offline');
-    const weightedScores = activePool.map((i) => {
-      const m = latestMap.get(i.id);
-      const health = m?.health_score ?? 50;
-      const lat = m?.latency_ms ?? 25;
-      if (settings.load_balancing_algorithm === 'lowest_latency') {
-        return { id: i.id, score: Math.max(1, 200 - lat) };
-      }
-      if (settings.load_balancing_algorithm === 'round_robin') {
-        return { id: i.id, score: 1 };
-      }
-      return { id: i.id, score: Math.max(1, (i.weight * health) / 100) };
-    });
-
-    const totalScore = weightedScores.reduce((acc, s) => acc + s.score, 0) || 1;
-    const shareMap = new Map(weightedScores.map((s) => [s.id, Number(((s.score / totalScore) * 100).toFixed(1))]));
-
-    let bestId = '';
-    let bestScore = -1;
-    for (const s of weightedScores) {
-      if (s.score > bestScore) {
-        bestScore = s.score;
-        bestId = s.id;
-      }
-    }
-
     const enriched: InterfaceWithMetrics[] = interfaces.map((iface) => ({
       ...iface,
       latest_metric: latestMap.get(iface.id) ?? null,
-      traffic_share_pct: shareMap.get(iface.id) ?? 0,
-      is_primary_failover: iface.id === bestId,
     }));
+
+    let hasDownloadMetrics = false;
+    let totalDownload = 0;
+    let totalUpload = 0;
+    let totalRxBytes = 0;
+    let totalTxBytes = 0;
+    let hasByteTotals = false;
+
+    for (const iface of enriched) {
+      const m = iface.latest_metric;
+      if (m && m.download_mbps !== null && m.upload_mbps !== null) {
+        hasDownloadMetrics = true;
+        totalDownload += m.download_mbps;
+        totalUpload += m.upload_mbps;
+      }
+      if (m && m.rx_bytes !== null && m.tx_bytes !== null) {
+        hasByteTotals = true;
+        totalRxBytes += m.rx_bytes;
+        totalTxBytes += m.tx_bytes;
+      }
+    }
+
+    const internetStatus: TelemetrySnapshot['internet_status'] =
+      this.recentProbeResults.length === 0
+        ? 'unavailable'
+        : this.lastProbeLatencyMs !== null
+          ? 'online'
+          : 'offline';
 
     return {
       timestamp: new Date().toISOString(),
+      server_status: 'running',
+      internet_status: internetStatus,
+      internet_latency_ms: this.lastProbeLatencyMs,
+      total_download_mbps: hasDownloadMetrics ? Number(totalDownload.toFixed(2)) : null,
+      total_upload_mbps: hasDownloadMetrics ? Number(totalUpload.toFixed(2)) : null,
+      total_rx_bytes: hasByteTotals ? totalRxBytes : null,
+      total_tx_bytes: hasByteTotals ? totalTxBytes : null,
       settings,
       interfaces: enriched,
-      history: this.store.getMetricHistory(28),
       usage: this.store.getUsageStats(),
       events: this.store.getSystemEvents(25),
       devices_summary: this.store.getDeviceCounts(),
@@ -307,9 +271,15 @@ export class NetworkMonitor {
 
 export interface TelemetrySnapshot {
   timestamp: string;
+  server_status: 'running';
+  internet_status: 'online' | 'offline' | 'unavailable';
+  internet_latency_ms: number | null;
+  total_download_mbps: number | null;
+  total_upload_mbps: number | null;
+  total_rx_bytes: number | null;
+  total_tx_bytes: number | null;
   settings: ReturnType<NetFusionStore['getSettings']>;
   interfaces: InterfaceWithMetrics[];
-  history: NetworkMetricRecord[];
   usage: ReturnType<NetFusionStore['getUsageStats']>;
   events: ReturnType<NetFusionStore['getSystemEvents']>;
   devices_summary: {

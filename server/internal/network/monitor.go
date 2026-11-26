@@ -44,6 +44,14 @@ func (m *Monitor) probeOnce() {
 	}
 
 	latencyMs := measureTCP("1.1.1.1:443")
+	if latencyMs < 0 {
+		latencyMs = measureTCP("8.8.8.8:443")
+	}
+	loss := 0.0
+	if latencyMs < 0 {
+		loss = 100.0
+	}
+
 	for _, iface := range ifaces {
 		if iface.Kind == "loopback" || !iface.IsUp {
 			continue
@@ -51,7 +59,7 @@ func (m *Monitor) probeOnce() {
 		m.collector.RecordSample(metrics.Sample{
 			InterfaceID:   iface.SystemName,
 			LatencyMs:     latencyMs,
-			PacketLossPct: 0,
+			PacketLossPct: loss,
 			RecordedAt:    time.Now().UTC(),
 		})
 	}

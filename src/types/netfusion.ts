@@ -1,23 +1,17 @@
-export type NavSection =
-  | 'overview'
-  | 'interfaces'
-  | 'streaming'
-  | 'clients'
-  | 'bonding'
-  | 'repository'
-  | 'settings';
+export type NavSection = 'dashboard' | 'devices' | 'networks' | 'settings';
 
 export interface NetworkMetric {
   id?: number;
   interface_id: string;
-  download_mbps: number;
-  upload_mbps: number;
-  latency_ms: number;
-  jitter_ms: number;
-  packet_loss_pct: number;
-  health_score: number;
-  rx_bytes: number;
-  tx_bytes: number;
+  download_mbps: number | null;
+  upload_mbps: number | null;
+  latency_ms: number | null;
+  jitter_ms: number | null;
+  packet_loss_pct: number | null;
+  health_score: number | null;
+  rx_bytes: number | null;
+  tx_bytes: number | null;
+  metrics_available: boolean;
   probe_source: string;
   recorded_at: string;
 }
@@ -32,14 +26,11 @@ export interface NetworkInterfaceItem {
   mac_address: string;
   is_host_detected: number;
   enabled: number;
-  simulated_down: number;
   weight: number;
   priority_order: number;
   status: 'healthy' | 'degraded' | 'offline' | 'disabled';
   updated_at: string;
   latest_metric: NetworkMetric | null;
-  traffic_share_pct: number;
-  is_primary_failover: boolean;
 }
 
 export interface PairedDevice {
@@ -51,22 +42,30 @@ export interface PairedDevice {
   pairing_status: 'paired' | 'pending' | 'revoked';
   connection_status: 'connected' | 'disconnected';
   app_version: string;
+  rx_bytes: number | null;
+  tx_bytes: number | null;
+  download_bps: number | null;
+  upload_bps: number | null;
   last_seen_at: string;
   created_at: string;
 }
 
 export interface GeneratedPairingCode {
+  pairing_id: string;
   pairing_code: string;
+  secret: string;
   expires_at: string;
   ttl_seconds: number;
   code_hint: string;
   platform_hint: 'any' | 'android' | 'windows';
   lan_addresses: string[];
+  qr_payload: string;
 }
 
 export interface PairingStatusSummary {
   active_codes: number;
   latest_code_expires_at: string | null;
+  latest_pairing_id: string | null;
   latest_code_hint: string | null;
   platform_hint: 'any' | 'android' | 'windows' | null;
   registered_devices: number;
@@ -79,36 +78,6 @@ export interface AdminAuthStatus {
   configured_via_env: boolean;
   claimed: boolean;
   authenticated: boolean;
-}
-
-export interface StreamingProfile {
-  id: string;
-  name: string;
-  description: string;
-  realtime_priority: number;
-  gaming_priority: number;
-  video_priority: number;
-  normal_priority: number;
-  background_priority: number;
-  is_active: number;
-}
-
-export interface QosRule {
-  id: string;
-  app_name: string;
-  match_pattern: string;
-  tier: 'P0' | 'P1' | 'P2' | 'P3' | 'P4';
-  priority_weight: number;
-  preferred_interface_id: string | null;
-  enabled: number;
-  created_at: string;
-}
-
-export interface QosTierDef {
-  tier: 'P0' | 'P1' | 'P2' | 'P3' | 'P4';
-  label: string;
-  weight: number;
-  description: string;
 }
 
 export interface UsageStat {
@@ -129,53 +98,25 @@ export interface SystemEvent {
 
 export interface NetFusionSettings {
   theme: 'light' | 'dark' | 'system';
-  gateway_mode: boolean;
   server_port: number;
   lan_only: boolean;
   auto_discovery: boolean;
   monitor_interval_seconds: number;
   heartbeat_timeout_seconds: number;
   pairing_code_ttl_seconds: number;
-  automatic_failover: boolean;
-  load_balancing_enabled: boolean;
-  load_balancing_algorithm: 'weighted_health' | 'lowest_latency' | 'round_robin';
-  bonding_enabled: boolean;
-  relay_mode: string;
-}
-
-export interface BondingStatusResponse {
-  enabled: boolean;
-  relay_mode: string;
-  relay_connected: boolean;
-  active_tunnels: number;
-  candidate_paths: number;
-  capabilities: {
-    network_monitoring: boolean;
-    load_balancing: boolean;
-    failover: boolean;
-    streaming_prioritization: boolean;
-    single_flow_aggregation: boolean;
-    combined_public_exit: boolean;
-  };
-  explanation: string;
-}
-
-export interface BondingPathItem {
-  interface_id: string;
-  display_name: string;
-  provider: string;
-  tunnel_state: string;
-  ready_for_quic: boolean;
-  latency_ms: number;
-  jitter_ms: number;
-  packet_loss_pct: number;
 }
 
 export interface TelemetrySnapshot {
   timestamp: string;
+  server_status: 'running';
+  internet_status: 'online' | 'offline' | 'unavailable';
+  internet_latency_ms: number | null;
+  total_download_mbps: number | null;
+  total_upload_mbps: number | null;
+  total_rx_bytes: number | null;
+  total_tx_bytes: number | null;
   settings: NetFusionSettings;
   interfaces: NetworkInterfaceItem[];
-  history: NetworkMetric[];
   usage: UsageStat[];
   events: SystemEvent[];
   devices_summary: {

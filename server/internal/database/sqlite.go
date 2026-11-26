@@ -24,8 +24,12 @@ CREATE TABLE IF NOT EXISTS devices (
   ip_address TEXT NOT NULL,
   token_hash TEXT NOT NULL,
   pairing_status TEXT NOT NULL DEFAULT 'paired' CHECK(pairing_status IN ('paired', 'pending', 'revoked')),
-  connection_status TEXT NOT NULL DEFAULT 'connected' CHECK(connection_status IN ('connected', 'disconnected')),
+  connection_status TEXT NOT NULL DEFAULT 'disconnected' CHECK(connection_status IN ('connected', 'disconnected')),
   app_version TEXT NOT NULL DEFAULT '1.0.0',
+  rx_bytes INTEGER,
+  tx_bytes INTEGER,
+  download_bps REAL,
+  upload_bps REAL,
   status TEXT NOT NULL DEFAULT 'paired',
   last_seen_at TEXT NOT NULL,
   created_at TEXT NOT NULL
@@ -39,6 +43,27 @@ CREATE TABLE IF NOT EXISTS pairing_codes (
   expires_at TEXT NOT NULL,
   used_at TEXT,
   used_by_device_id TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS admin_credentials (
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  passcode_hash TEXT NOT NULL,
+  salt TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS system_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  level TEXT NOT NULL CHECK(level IN ('info', 'warning', 'error')),
+  category TEXT NOT NULL,
+  message TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
 `
@@ -60,7 +85,43 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	return &Store{DB: db}, nil
+
+	store := &Store{DB: db}
+	store.migrateLegacyColumns()
+	// Remove any legacy experimental/mock rows if opening an older DB
+	_, _ = db.Exec(`DELETE FROM devices WHERE id IN ('dev-win-local', 'dev-pixel-9')`)
+	return store, nil
+}
+
+func (s *Store) migrateLegacyColumns() {
+	rows, err := s.DB.Query(`PRAGMA table_info(devices)`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	existing := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err == nil {
+			existing[name] = true
+		}
+	}
+	if !existing["rx_bytes"] {
+		_, _ = s.DB.Exec(`ALTER TABLE devices ADD COLUMN rx_bytes INTEGER`)
+	}
+	if !existing["tx_bytes"] {
+		_, _ = s.DB.Exec(`ALTER TABLE devices ADD COLUMN tx_bytes INTEGER`)
+	}
+	if !existing["download_bps"] {
+		_, _ = s.DB.Exec(`ALTER TABLE devices ADD COLUMN download_bps REAL`)
+	}
+	if !existing["upload_bps"] {
+		_, _ = s.DB.Exec(`ALTER TABLE devices ADD COLUMN upload_bps REAL`)
+	}
 }
 
 func (s *Store) Close() error {

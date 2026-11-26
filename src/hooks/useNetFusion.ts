@@ -1,15 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   AdminAuthStatus,
-  BondingPathItem,
-  BondingStatusResponse,
   GeneratedPairingCode,
   NetFusionSettings,
   PairedDevice,
   PairingStatusSummary,
-  QosRule,
-  QosTierDef,
-  StreamingProfile,
   TelemetrySnapshot,
 } from '../types/netfusion';
 
@@ -30,23 +25,14 @@ export function useNetFusion() {
   });
   // Held strictly in React memory (never persisted to localStorage/sessionStorage)
   const [adminToken, setAdminToken] = useState<string | null>(null);
-
-  const [profiles, setProfiles] = useState<StreamingProfile[]>([]);
-  const [qosRules, setQosRules] = useState<QosRule[]>([]);
-  const [qosTiers, setQosTiers] = useState<QosTierDef[]>([]);
-  const [bondingStatus, setBondingStatus] = useState<BondingStatusResponse | null>(null);
-  const [bondingPaths, setBondingPaths] = useState<BondingPathItem[]>([]);
   const [sseConnected, setSseConnected] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [probingId, setProbingId] = useState<string | null>(null);
+  const [checkingNetwork, setCheckingNetwork] = useState(false);
 
   const prevDeviceSigRef = useRef<string>('');
 
-  const apiUrl = useCallback(
-    (path: string) => `${apiBaseUrl}${path}`,
-    [apiBaseUrl],
-  );
+  const apiUrl = useCallback((path: string) => `${apiBaseUrl}${path}`, [apiBaseUrl]);
 
   const setApiBaseUrl = useCallback((nextUrl: string) => {
     const trimmed = nextUrl.trim().replace(/\/+$/, '');
@@ -60,7 +46,7 @@ export function useNetFusion() {
         setApiBaseUrlState(parsed.origin);
       }
     } catch {
-      // Ignore invalid URL until valid
+      // Ignore invalid URL
     }
   }, []);
 
@@ -120,7 +106,7 @@ export function useNetFusion() {
         if (clientsRes.status === 401 || pairingRes.status === 401) {
           setAdminToken(null);
           setAdminAuthStatus((prev) => ({ ...prev, authenticated: false }));
-          setClientsError('Administrator session expired. Unlock device management to continue.');
+          setClientsError('Administrator session expired. Enter your password to continue.');
           return;
         }
 
@@ -144,38 +130,15 @@ export function useNetFusion() {
     [adminToken, apiUrl],
   );
 
-  const fetchSecondaryData = useCallback(async () => {
+  const fetchHealth = useCallback(async () => {
     try {
-      const [healthRes, profilesRes, qosRes, bondRes, pathsRes] = await Promise.all([
-        fetch(apiUrl('/api/health')),
-        fetch(apiUrl('/api/streaming/profiles')),
-        fetch(apiUrl('/api/qos/policies')),
-        fetch(apiUrl('/api/bonding/status')),
-        fetch(apiUrl('/api/bonding/paths')),
-      ]);
-
-      if (healthRes.ok) {
-        const data = (await healthRes.json()) as { lan_addresses?: string[] };
+      const res = await fetch(apiUrl('/api/health'));
+      if (res.ok) {
+        const data = (await res.json()) as { lan_addresses?: string[] };
         setLanAddresses(data.lan_addresses ?? []);
       }
-      if (profilesRes.ok) {
-        const data = (await profilesRes.json()) as { profiles: StreamingProfile[] };
-        setProfiles(data.profiles);
-      }
-      if (qosRes.ok) {
-        const data = (await qosRes.json()) as { rules: QosRule[]; tiers: QosTierDef[] };
-        setQosRules(data.rules);
-        setQosTiers(data.tiers);
-      }
-      if (bondRes.ok) {
-        setBondingStatus((await bondRes.json()) as BondingStatusResponse);
-      }
-      if (pathsRes.ok) {
-        const data = (await pathsRes.json()) as { paths: BondingPathItem[] };
-        setBondingPaths(data.paths);
-      }
     } catch {
-      // Non-fatal secondary refresh error
+      // Ignore transient errors
     }
   }, [apiUrl]);
 
@@ -200,7 +163,7 @@ export function useNetFusion() {
     };
 
     void loadInitial();
-    void fetchSecondaryData();
+    void fetchHealth();
     void fetchAdminStatus();
 
     const eventSource = new EventSource(apiUrl('/api/events'));
@@ -226,9 +189,8 @@ export function useNetFusion() {
       active = false;
       eventSource.close();
     };
-  }, [apiUrl, applyThemeToDom, fetchAdminStatus, fetchSecondaryData]);
+  }, [apiUrl, applyThemeToDom, fetchAdminStatus, fetchHealth]);
 
-  // Live refresh authenticated devices whenever SSE reports a device count/status shift or periodically
   useEffect(() => {
     if (!adminToken || !snapshot) return;
     const sig = `${snapshot.devices_summary.total}:${snapshot.devices_summary.connected}:${snapshot.devices_summary.disconnected}`;
@@ -268,7 +230,7 @@ export function useNetFusion() {
     });
     const data = (await res.json()) as { admin_token?: string; error?: string };
     if (!res.ok || !data.admin_token) {
-      throw new Error(data.error || 'Failed to configure administrator passcode');
+      throw new Error(data.error || 'Failed to set administrator password');
     }
     setAdminToken(data.admin_token);
     setAdminAuthStatus({ configured_via_env: false, claimed: true, authenticated: true });
@@ -283,7 +245,7 @@ export function useNetFusion() {
     });
     const data = (await res.json()) as { admin_token?: string; error?: string };
     if (!res.ok || !data.admin_token) {
-      throw new Error(data.error || 'Invalid administrator passcode');
+      throw new Error(data.error || 'Incorrect administrator password');
     }
     setAdminToken(data.admin_token);
     setAdminAuthStatus((prev) => ({ ...prev, claimed: true, authenticated: true }));
@@ -303,10 +265,11 @@ export function useNetFusion() {
     setAdminAuthStatus((prev) => ({ ...prev, authenticated: false }));
   };
 
-  const generatePairingCode = async (
-    platformHint: 'any' | 'android' | 'windows' = 'any',
-    ttlSeconds?: number,
-  ): Promise<GeneratedPairingCode> => {
+  const generatePairingCode = async (options?: {
+    platformHint?: 'any' | 'android' | 'windows';
+    ttlSeconds?: number;
+    serverUrl?: string;
+  }): Promise<GeneratedPairingCode> => {
     if (!adminToken) {
       throw new Error('Administrator authentication required');
     }
@@ -316,11 +279,15 @@ export function useNetFusion() {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${adminToken}`,
       },
-      body: JSON.stringify({ platform_hint: platformHint, ttl_seconds: ttlSeconds }),
+      body: JSON.stringify({
+        platform_hint: options?.platformHint ?? 'any',
+        ttl_seconds: options?.ttlSeconds ?? 120,
+        server_url: options?.serverUrl,
+      }),
     });
     const data = (await res.json()) as GeneratedPairingCode & { error?: string };
     if (!res.ok) {
-      throw new Error(data.error || 'Failed to generate pairing code');
+      throw new Error(data.error || 'Failed to generate QR pairing code');
     }
     await fetchClientsAndPairing(adminToken);
     return data;
@@ -342,40 +309,17 @@ export function useNetFusion() {
     }
   };
 
-  const updateInterface = async (
-    id: string,
-    patch: { enabled?: boolean; simulated_down?: boolean; weight?: number },
-  ) => {
-    const res = await fetch(apiUrl(`/api/interfaces/${encodeURIComponent(id)}`), {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch),
-    });
-    if (res.ok) {
-      const data = (await res.json()) as { snapshot: TelemetrySnapshot };
-      setSnapshot(data.snapshot);
-      void fetchSecondaryData();
-    }
-  };
-
-  const probeInterface = async (id: string) => {
-    setProbingId(id);
+  const checkNetworkNow = async () => {
+    setCheckingNetwork(true);
     try {
-      const res = await fetch(apiUrl(`/api/interfaces/${encodeURIComponent(id)}/probe`), {
-        method: 'POST',
-      });
+      const res = await fetch(apiUrl('/api/network/check'), { method: 'POST' });
       if (res.ok) {
-        const data = (await res.json()) as {
-          probe: { cloudflare_ms: number | null; google_dns_ms: number | null };
-          snapshot: TelemetrySnapshot;
-        };
+        const data = (await res.json()) as { snapshot: TelemetrySnapshot };
         setSnapshot(data.snapshot);
-        return data.probe;
       }
     } finally {
-      setProbingId(null);
+      setCheckingNetwork(false);
     }
-    return null;
   };
 
   const updateSettings = async (patch: Partial<NetFusionSettings>) => {
@@ -390,67 +334,6 @@ export function useNetFusion() {
     if (res.ok) {
       const data = (await res.json()) as { settings: NetFusionSettings };
       setSnapshot((prev) => (prev ? { ...prev, settings: data.settings } : prev));
-    }
-  };
-
-  const setGatewayMode = async (gatewayMode: boolean) => {
-    const res = await fetch(apiUrl('/api/gateway/mode'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ gateway_mode: gatewayMode }),
-    });
-    if (res.ok) {
-      const data = (await res.json()) as { snapshot: TelemetrySnapshot };
-      setSnapshot(data.snapshot);
-    }
-  };
-
-  const activateStreamingProfile = async (profileId: string) => {
-    const res = await fetch(apiUrl('/api/streaming/profile'), {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ profile_id: profileId }),
-    });
-    if (res.ok) {
-      const data = (await res.json()) as { profiles: StreamingProfile[] };
-      setProfiles(data.profiles);
-    }
-  };
-
-  const toggleQosRule = async (id: string, enabled: boolean) => {
-    const res = await fetch(apiUrl('/api/qos/policies'), {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, enabled }),
-    });
-    if (res.ok) {
-      const data = (await res.json()) as { rules: QosRule[] };
-      setQosRules(data.rules);
-    }
-  };
-
-  const createQosRule = async (input: {
-    app_name: string;
-    match_pattern: string;
-    tier: QosRule['tier'];
-    preferred_interface_id: string | null;
-  }) => {
-    const res = await fetch(apiUrl('/api/qos/rules'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(input),
-    });
-    if (res.ok) {
-      const data = (await res.json()) as { rules: QosRule[] };
-      setQosRules(data.rules);
-    }
-  };
-
-  const deleteQosRule = async (id: string) => {
-    const res = await fetch(apiUrl(`/api/qos/rules/${encodeURIComponent(id)}`), { method: 'DELETE' });
-    if (res.ok) {
-      const data = (await res.json()) as { rules: QosRule[] };
-      setQosRules(data.rules);
     }
   };
 
@@ -471,22 +354,11 @@ export function useNetFusion() {
     refreshClients: () => fetchClientsAndPairing(adminToken),
     generatePairingCode,
     revokeClient,
-    profiles,
-    qosRules,
-    qosTiers,
-    bondingStatus,
-    bondingPaths,
     sseConnected,
     loading,
     error,
-    probingId,
-    updateInterface,
-    probeInterface,
+    checkingNetwork,
+    checkNetworkNow,
     updateSettings,
-    setGatewayMode,
-    activateStreamingProfile,
-    toggleQosRule,
-    createQosRule,
-    deleteQosRule,
   };
 }

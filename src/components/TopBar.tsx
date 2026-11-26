@@ -1,35 +1,28 @@
-import { Menu, Moon, RefreshCw, Sun } from 'lucide-react';
+import { Menu, Moon, QrCode, Sun } from 'lucide-react';
 import type { NavSection, NetFusionSettings } from '../types/netfusion';
 
 interface TopBarProps {
   activeSection: NavSection;
   sseConnected: boolean;
-  intervalSeconds: number;
   theme: NetFusionSettings['theme'];
-  probing: boolean;
   onToggleTheme: () => void;
-  onRunProbe: () => void;
+  onAddDevice: () => void;
   onOpenMobileNav: () => void;
 }
 
 const SECTION_LABELS: Record<NavSection, string> = {
-  overview: 'Overview',
-  interfaces: 'Network Interfaces',
-  streaming: 'Streaming & QoS',
-  clients: 'Clients & Pairing',
-  bonding: 'Bonding Engine',
-  repository: 'Go v0.1 Repository',
+  dashboard: 'Dashboard',
+  devices: 'Devices',
+  networks: 'Networks',
   settings: 'Settings',
 };
 
 export function TopBar({
   activeSection,
   sseConnected,
-  intervalSeconds,
   theme,
-  probing,
   onToggleTheme,
-  onRunProbe,
+  onAddDevice,
   onOpenMobileNav,
 }: TopBarProps) {
   const isDark =
@@ -59,16 +52,10 @@ export function TopBar({
         </div>
       </div>
 
-      <div className="flex items-center gap-4 shrink-0">
-        <div className="hidden sm:flex items-center gap-2 text-xs font-mono tabular-nums text-slate-600 dark:text-slate-400 whitespace-nowrap">
-          <span
-            className={`w-2 h-2 rounded-full ${
-              sseConnected ? 'bg-emerald-600 dark:bg-emerald-400' : 'bg-amber-600 dark:bg-amber-400'
-            }`}
-            aria-hidden="true"
-          />
-          <span>{sseConnected ? `Live · ${intervalSeconds}s` : 'Reconnecting'}</span>
-        </div>
+      <div className="flex items-center gap-3 shrink-0">
+        <span className="hidden sm:inline text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400 whitespace-nowrap">
+          {sseConnected ? 'Live updates on' : 'Reconnecting'}
+        </span>
 
         <button
           type="button"
@@ -82,12 +69,11 @@ export function TopBar({
 
         <button
           type="button"
-          onClick={onRunProbe}
-          disabled={probing}
-          className="flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white transition-colors whitespace-nowrap shrink-0"
+          onClick={onAddDevice}
+          className="flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition-colors whitespace-nowrap shrink-0"
         >
-          <RefreshCw className={`w-3.5 h-3.5 ${probing ? 'animate-spin' : ''}`} />
-          <span>{probing ? 'Probing...' : 'Probe Uplinks'}</span>
+          <QrCode className="w-3.5 h-3.5" />
+          <span>Add Device</span>
         </button>
       </div>
     </header>

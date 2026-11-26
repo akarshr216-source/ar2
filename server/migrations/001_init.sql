@@ -1,4 +1,4 @@
--- NetFusion v0.1 SQLite Schema
+-- NetFusion SQLite Schema (Shared Authoritative Registry)
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
@@ -10,8 +10,12 @@ CREATE TABLE IF NOT EXISTS devices (
   ip_address TEXT NOT NULL,
   token_hash TEXT NOT NULL,
   pairing_status TEXT NOT NULL DEFAULT 'paired' CHECK(pairing_status IN ('paired', 'pending', 'revoked')),
-  connection_status TEXT NOT NULL DEFAULT 'connected' CHECK(connection_status IN ('connected', 'disconnected')),
+  connection_status TEXT NOT NULL DEFAULT 'disconnected' CHECK(connection_status IN ('connected', 'disconnected')),
   app_version TEXT NOT NULL DEFAULT '1.0.0',
+  rx_bytes INTEGER,
+  tx_bytes INTEGER,
+  download_bps REAL,
+  upload_bps REAL,
   status TEXT NOT NULL DEFAULT 'paired',
   last_seen_at TEXT NOT NULL,
   created_at TEXT NOT NULL
@@ -43,7 +47,7 @@ CREATE TABLE IF NOT EXISTS interfaces (
   kind TEXT NOT NULL CHECK(kind IN ('ethernet', 'wifi', 'cellular_usb', 'hotspot', 'loopback')),
   ip_address TEXT NOT NULL,
   mac_address TEXT NOT NULL,
-  is_host_detected INTEGER NOT NULL DEFAULT 0,
+  is_host_detected INTEGER NOT NULL DEFAULT 1,
   enabled INTEGER NOT NULL DEFAULT 1,
   simulated_down INTEGER NOT NULL DEFAULT 0,
   weight INTEGER NOT NULL DEFAULT 50,
@@ -55,52 +59,20 @@ CREATE TABLE IF NOT EXISTS interfaces (
 CREATE TABLE IF NOT EXISTS network_metrics (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   interface_id TEXT NOT NULL,
-  download_mbps REAL NOT NULL,
-  upload_mbps REAL NOT NULL,
-  latency_ms REAL NOT NULL,
-  jitter_ms REAL NOT NULL,
-  packet_loss_pct REAL NOT NULL,
-  health_score REAL NOT NULL,
-  rx_bytes INTEGER NOT NULL DEFAULT 0,
-  tx_bytes INTEGER NOT NULL DEFAULT 0,
-  probe_source TEXT NOT NULL DEFAULT 'tcp_probe',
+  download_mbps REAL,
+  upload_mbps REAL,
+  latency_ms REAL,
+  jitter_ms REAL,
+  packet_loss_pct REAL,
+  health_score REAL,
+  rx_bytes INTEGER,
+  tx_bytes INTEGER,
+  probe_source TEXT NOT NULL DEFAULT 'os_nic',
   recorded_at TEXT NOT NULL,
   FOREIGN KEY(interface_id) REFERENCES interfaces(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_metrics_iface_time ON network_metrics(interface_id, recorded_at DESC);
-
-CREATE TABLE IF NOT EXISTS streaming_profiles (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  description TEXT NOT NULL,
-  realtime_priority INTEGER NOT NULL,
-  gaming_priority INTEGER NOT NULL,
-  video_priority INTEGER NOT NULL,
-  normal_priority INTEGER NOT NULL,
-  background_priority INTEGER NOT NULL,
-  is_active INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS qos_rules (
-  id TEXT PRIMARY KEY,
-  app_name TEXT NOT NULL,
-  match_pattern TEXT NOT NULL,
-  tier TEXT NOT NULL CHECK(tier IN ('P0', 'P1', 'P2', 'P3', 'P4')),
-  priority_weight INTEGER NOT NULL,
-  preferred_interface_id TEXT,
-  enabled INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS bonding_sessions (
-  id TEXT PRIMARY KEY,
-  relay_endpoint TEXT,
-  mode TEXT NOT NULL DEFAULT 'disabled',
-  active_paths INTEGER NOT NULL DEFAULT 0,
-  status TEXT NOT NULL DEFAULT 'disabled',
-  updated_at TEXT NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS usage_stats (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

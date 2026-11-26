@@ -1,19 +1,18 @@
 import { useState } from 'react';
-import { BondingView } from './components/BondingView';
-import { ClientsView } from './components/ClientsView';
-import { InterfacesView } from './components/InterfacesView';
-import { OverviewView } from './components/OverviewView';
-import { RepositoryView } from './components/RepositoryView';
+import { DashboardView } from './components/DashboardView';
+import { DevicesView } from './components/DevicesView';
+import { NetworksView } from './components/NetworksView';
+import { QrAddDeviceModal } from './components/QrAddDeviceModal';
 import { SettingsView } from './components/SettingsView';
 import { Sidebar } from './components/Sidebar';
-import { StreamingQosView } from './components/StreamingQosView';
 import { TopBar } from './components/TopBar';
 import { useNetFusion } from './hooks/useNetFusion';
 import type { NavSection } from './types/netfusion';
 
 export default function App() {
-  const [activeSection, setActiveSection] = useState<NavSection>('overview');
+  const [activeSection, setActiveSection] = useState<NavSection>('dashboard');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [addDeviceOpen, setAddDeviceOpen] = useState(false);
 
   const {
     apiBaseUrl,
@@ -32,23 +31,12 @@ export default function App() {
     refreshClients,
     generatePairingCode,
     revokeClient,
-    profiles,
-    qosRules,
-    qosTiers,
-    bondingStatus,
-    bondingPaths,
     sseConnected,
     loading,
     error,
-    probingId,
-    updateInterface,
-    probeInterface,
+    checkingNetwork,
+    checkNetworkNow,
     updateSettings,
-    setGatewayMode,
-    activateStreamingProfile,
-    toggleQosRule,
-    createQosRule,
-    deleteQosRule,
   } = useNetFusion();
 
   const currentTheme = snapshot?.settings.theme ?? 'system';
@@ -61,124 +49,88 @@ export default function App() {
     void updateSettings({ theme: isCurrentlyDark ? 'light' : 'dark' });
   };
 
-  const handleGlobalProbe = () => {
-    const target = snapshot?.interfaces.find((i) => i.enabled) ?? snapshot?.interfaces[0];
-    if (target) {
-      void probeInterface(target.id);
-    }
-  };
-
   return (
     <div className="min-h-screen flex bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
       <Sidebar
         activeSection={activeSection}
         onSelect={setActiveSection}
-        gatewayMode={snapshot?.settings.gateway_mode ?? false}
         mobileOpen={mobileNavOpen}
         onCloseMobile={() => setMobileNavOpen(false)}
+        connectedDevicesCount={snapshot?.devices_summary.connected ?? 0}
       />
 
       <div className="flex-1 flex flex-col min-w-0">
         <TopBar
           activeSection={activeSection}
           sseConnected={sseConnected}
-          intervalSeconds={snapshot?.settings.monitor_interval_seconds ?? 3}
           theme={currentTheme}
-          probing={probingId !== null}
           onToggleTheme={handleToggleTheme}
-          onRunProbe={handleGlobalProbe}
+          onAddDevice={() => setAddDeviceOpen(true)}
           onOpenMobileNav={() => setMobileNavOpen(true)}
         />
 
-        <main className="flex-1 p-4 sm:p-6 max-w-7xl w-full mx-auto">
+        <main className="flex-1 p-4 sm:p-6 max-w-6xl w-full mx-auto">
           {loading && !snapshot ? (
             <div className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
                 {[0, 1, 2, 3].map((k) => (
                   <div
                     key={k}
-                    className="h-24 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 animate-pulse"
+                    className="h-28 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 animate-pulse"
                   />
                 ))}
               </div>
-              <div className="h-64 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 animate-pulse" />
+              <div className="h-48 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 animate-pulse" />
             </div>
           ) : error && !snapshot ? (
-            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 max-w-lg">
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 max-w-lg space-y-2">
               <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
                 NetFusion Server Unreachable
               </h2>
-              <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">{error}</p>
+              <p className="text-sm text-slate-600 dark:text-slate-400">{error}</p>
             </div>
           ) : snapshot ? (
             <>
-              {activeSection === 'overview' && (
-                <OverviewView
+              {activeSection === 'dashboard' && (
+                <DashboardView
                   snapshot={snapshot}
+                  lanAddresses={lanAddresses}
                   clients={clients}
                   isAdminAuthenticated={isAdminAuthenticated}
-                  probingId={probingId}
-                  onProbeInterface={(id) => void probeInterface(id)}
-                  onToggleInterface={(id, enabled) => void updateInterface(id, { enabled })}
-                  onToggleSimulateDown={(id, simulated_down) =>
-                    void updateInterface(id, { simulated_down })
-                  }
-                  onSetGatewayMode={(enabled) => void setGatewayMode(enabled)}
-                  onNavigateClients={() => setActiveSection('clients')}
+                  checkingNetwork={checkingNetwork}
+                  onAddDevice={() => setAddDeviceOpen(true)}
+                  onOpenDevices={() => setActiveSection('devices')}
+                  onOpenSettings={() => setActiveSection('settings')}
+                  onCheckNetwork={() => void checkNetworkNow()}
                 />
               )}
 
-              {activeSection === 'interfaces' && (
-                <InterfacesView
-                  interfaces={snapshot.interfaces}
-                  usage={snapshot.usage}
-                  probingId={probingId}
-                  onUpdateWeight={(id, weight) => void updateInterface(id, { weight })}
-                  onToggleEnabled={(id, enabled) => void updateInterface(id, { enabled })}
-                  onToggleSimDown={(id, simulated_down) =>
-                    void updateInterface(id, { simulated_down })
-                  }
-                  onProbe={(id) => void probeInterface(id)}
-                />
-              )}
-
-              {activeSection === 'streaming' && (
-                <StreamingQosView
-                  profiles={profiles}
-                  tiers={qosTiers}
-                  rules={qosRules}
-                  interfaces={snapshot.interfaces}
-                  onActivateProfile={(id) => void activateStreamingProfile(id)}
-                  onToggleRule={(id, enabled) => void toggleQosRule(id, enabled)}
-                  onCreateRule={createQosRule}
-                  onDeleteRule={(id) => void deleteQosRule(id)}
-                />
-              )}
-
-              {activeSection === 'clients' && (
-                <ClientsView
+              {activeSection === 'devices' && (
+                <DevicesView
                   clients={clients}
                   clientsLoading={clientsLoading}
                   clientsError={clientsError}
                   pairingStatus={pairingStatus}
                   adminAuthStatus={adminAuthStatus}
                   isAdminAuthenticated={isAdminAuthenticated}
-                  serverPort={snapshot.settings.server_port}
-                  lanAddresses={lanAddresses}
                   onClaimAdmin={claimAdminPasscode}
                   onLoginAdmin={loginAdmin}
                   onLogoutAdmin={logoutAdmin}
                   onRefreshClients={refreshClients}
-                  onGeneratePairingCode={generatePairingCode}
+                  onOpenAddDevice={() => setAddDeviceOpen(true)}
                   onRevokeClient={revokeClient}
                 />
               )}
 
-              {activeSection === 'bonding' && (
-                <BondingView status={bondingStatus} paths={bondingPaths} />
+              {activeSection === 'networks' && (
+                <NetworksView
+                  interfaces={snapshot.interfaces}
+                  internetStatus={snapshot.internet_status}
+                  internetLatencyMs={snapshot.internet_latency_ms}
+                  checkingNetwork={checkingNetwork}
+                  onCheckNetwork={() => void checkNetworkNow()}
+                />
               )}
-
-              {activeSection === 'repository' && <RepositoryView apiBaseUrl={apiBaseUrl} />}
 
               {activeSection === 'settings' && (
                 <SettingsView
@@ -187,13 +139,26 @@ export default function App() {
                   apiBaseUrl={apiBaseUrl}
                   onChangeApiBaseUrl={setApiBaseUrl}
                   onUpdateSettings={(patch) => void updateSettings(patch)}
-                  onSetGatewayMode={(enabled) => void setGatewayMode(enabled)}
                 />
               )}
             </>
           ) : null}
         </main>
       </div>
+
+      <QrAddDeviceModal
+        open={addDeviceOpen}
+        onClose={() => setAddDeviceOpen(false)}
+        apiBaseUrl={apiBaseUrl}
+        serverPort={snapshot?.settings.server_port ?? 8080}
+        lanAddresses={lanAddresses}
+        adminAuthStatus={adminAuthStatus}
+        isAdminAuthenticated={isAdminAuthenticated}
+        pairingStatus={pairingStatus}
+        onClaimAdmin={claimAdminPasscode}
+        onLoginAdmin={loginAdmin}
+        onGeneratePairingCode={generatePairingCode}
+      />
     </div>
   );
 }

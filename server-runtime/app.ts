@@ -1,50 +1,10 @@
 import crypto from 'node:crypto';
-import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
-import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { NetFusionStore } from './db.ts';
 import { NetworkMonitor } from './network-monitor.ts';
-import type { DevicePlatform, NetFusionSettings, QosRuleRecord } from './types.ts';
-
-const WORKSPACE_ROOT = path.resolve(process.cwd());
-
-export const REPO_ALLOWLIST_FILES = [
-  'README.md',
-  'docs/ARCHITECTURE.md',
-  'docs/API.md',
-  'docs/SECURITY.md',
-  'deployment/windows/configure-firewall.ps1',
-  'deployment/windows/run-server.ps1',
-  'server/go.mod',
-  'server/configs/server.json',
-  'server/configs/streaming.json',
-  'server/configs/qos.json',
-  'server/migrations/001_init.sql',
-  'server/cmd/netfusion-server/main.go',
-  'server/cmd/netfusion-diagnostics/main.go',
-  'server/internal/config/config.go',
-  'server/internal/database/sqlite.go',
-  'server/internal/network/discovery.go',
-  'server/internal/network/monitor.go',
-  'server/internal/metrics/collector.go',
-  'server/internal/scheduler/scheduler.go',
-  'server/internal/streaming/classifier.go',
-  'server/internal/bonding/manager.go',
-  'server/internal/auth/pairing.go',
-  'server/internal/api/server.go',
-  'android/settings.gradle.kts',
-  'android/build.gradle.kts',
-  'android/app/build.gradle.kts',
-  'android/app/src/main/AndroidManifest.xml',
-  'android/app/src/main/java/com/netfusion/MainActivity.kt',
-  'android/app/src/main/java/com/netfusion/data/Models.kt',
-  'android/app/src/main/java/com/netfusion/data/TokenStore.kt',
-  'android/app/src/main/java/com/netfusion/network/DeviceInfoProvider.kt',
-  'android/app/src/main/java/com/netfusion/network/NetFusionApiClient.kt',
-  'android/app/src/main/java/com/netfusion/services/HeartbeatManager.kt',
-  'android/app/src/main/java/com/netfusion/ui/PairingScreen.kt',
-];
+import type { DevicePlatform, NetFusionSettings } from './types.ts';
 
 function getLanIPv4Addresses(): string[] {
   const nets = os.networkInterfaces();
@@ -68,11 +28,66 @@ function normalizeClientIp(req: Request, bodyIp?: unknown): string {
   return raw.startsWith('::ffff:') ? raw.slice(7) : raw;
 }
 
+function extractRemoteSocketIp(req: Request): string {
+  const raw = req.socket.remoteAddress || req.ip || '';
+  return raw.startsWith('::ffff:') ? raw.slice(7) : raw;
+}
+
+export function isLocalOrLanAddress(ip: string): boolean {
+  if (!ip) return false;
+  if (ip === '127.0.0.1' || ip === '::1') return true;
+  if (net.isIPv4(ip)) {
+    const parts = ip.split('.').map(Number);
+    if (parts[0] === 10) return true;
+    if (parts[0] === 127) return true;
+    if (parts[0] === 192 && parts[1] === 168) return true;
+    if (parts[0] === 169 && parts[1] === 254) return true;
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    return false;
+  }
+  const lower = ip.toLowerCase();
+  return lower.startsWith('fe80:') || lower.startsWith('fc') || lower.startsWith('fd');
+}
+
 function extractBearerToken(req: Request): string | null {
   const header = req.header('authorization');
   if (!header) return null;
   const match = header.match(/^Bearer\s+(.+)$/i);
   return match ? match[1].trim() : null;
+}
+
+class SlidingAttemptLimiter {
+  private readonly attempts = new Map<string, number[]>();
+  private readonly maxAttempts: number;
+  private readonly windowMs: number;
+
+  constructor(maxAttempts = 5, windowMs = 5 * 60 * 1000) {
+    this.maxAttempts = maxAttempts;
+    this.windowMs = windowMs;
+  }
+
+  public isBlocked(key: string): { blocked: boolean; retryAfterSeconds: number } {
+    const now = Date.now();
+    const list = (this.attempts.get(key) ?? []).filter((ts) => now - ts < this.windowMs);
+    this.attempts.set(key, list);
+    if (list.length >= this.maxAttempts) {
+      const oldest = list[0];
+      const retryAfterSeconds = Math.max(1, Math.ceil((this.windowMs - (now - oldest)) / 1000));
+      return { blocked: true, retryAfterSeconds };
+    }
+    return { blocked: false, retryAfterSeconds: 0 };
+  }
+
+  public recordFailure(key: string): void {
+    const now = Date.now();
+    const list = (this.attempts.get(key) ?? []).filter((ts) => now - ts < this.windowMs);
+    list.push(now);
+    this.attempts.set(key, list);
+  }
+
+  public clear(key: string): void {
+    this.attempts.delete(key);
+  }
 }
 
 export interface NetFusionAppInstance {
@@ -90,9 +105,10 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
     monitor.start();
   }
 
-  // Server-side in-memory admin bearer sessions (never persisted in plaintext)
   const adminSessions = new Map<string, number>();
   const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+  const pairLimiter = new SlidingAttemptLimiter(5, 5 * 60 * 1000);
+  const adminLoginLimiter = new SlidingAttemptLimiter(5, 5 * 60 * 1000);
 
   const isAdminSessionValid = (token: string | null): boolean => {
     if (!token) return false;
@@ -112,33 +128,47 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
     return { admin_token: token, expires_at: new Date(expiresAt).toISOString() };
   };
 
+  const requireLanAdminAccess = (req: Request, res: Response, next: NextFunction): void => {
+    const settings = store.getSettings();
+    if (settings.lan_only) {
+      const remoteIp = extractRemoteSocketIp(req);
+      if (!isLocalOrLanAddress(remoteIp)) {
+        res.status(403).json({
+          error: 'Administration endpoints are restricted to the local PC and local Wi-Fi network.',
+        });
+        return;
+      }
+    }
+    next();
+  };
+
   const requireAdmin = (req: Request, res: Response, next: NextFunction): void => {
     const token = extractBearerToken(req);
     if (!isAdminSessionValid(token)) {
-      res.status(401).json({ error: 'Administrator authentication required for device management.' });
+      res.status(401).json({ error: 'Administrator password required for device management.' });
       return;
     }
     next();
   };
 
   const app = express();
-  app.use(express.json({ limit: '256kb' }));
+  app.use(express.json({ limit: '128kb' }));
 
   app.get('/api/health', (_req, res) => {
     const settings = store.getSettings();
     res.json({
       status: 'ok',
       application: 'NetFusion',
-      version: '0.1.0',
-      mode: settings.gateway_mode ? 'gateway' : 'monitoring',
+      version: '0.2.0',
+      server_port: settings.server_port,
       lan_addresses: getLanIPv4Addresses(),
       uptime_seconds: Math.round(process.uptime()),
       timestamp: new Date().toISOString(),
     });
   });
 
-  // Administrator Auth Endpoints for Device Management
-  app.get('/api/admin/status', (req, res) => {
+  // Administrator Auth Endpoints (protected against public internet & brute force)
+  app.get('/api/admin/status', requireLanAdminAccess, (req, res) => {
     const authMode = store.getAdminAuthMode();
     const token = extractBearerToken(req);
     res.json({
@@ -148,11 +178,11 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
     });
   });
 
-  app.post('/api/admin/claim', (req, res) => {
+  app.post('/api/admin/claim', requireLanAdminAccess, (req, res) => {
     const body = req.body as Record<string, unknown>;
     const passcode = typeof body.passcode === 'string' ? body.passcode.trim() : '';
     if (passcode.length < 6 || passcode.length > 128) {
-      res.status(400).json({ error: 'Passcode must be between 6 and 128 characters.' });
+      res.status(400).json({ error: 'Password must be between 6 and 128 characters.' });
       return;
     }
     try {
@@ -160,27 +190,40 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
       const session = issueAdminSession();
       res.status(201).json(session);
     } catch (err) {
-      res.status(409).json({ error: err instanceof Error ? err.message : 'Admin already claimed.' });
+      res.status(409).json({ error: err instanceof Error ? err.message : 'Admin already configured.' });
     }
   });
 
-  app.post('/api/admin/login', (req, res) => {
+  app.post('/api/admin/login', requireLanAdminAccess, (req, res) => {
+    const limiterKey = extractRemoteSocketIp(req);
+    const rate = adminLoginLimiter.isBlocked(limiterKey);
+    if (rate.blocked) {
+      res.setHeader('Retry-After', String(rate.retryAfterSeconds));
+      res.status(429).json({
+        error: `Too many failed login attempts. Try again in ${rate.retryAfterSeconds} seconds.`,
+      });
+      return;
+    }
+
     const authMode = store.getAdminAuthMode();
     if (!authMode.claimed) {
-      res.status(409).json({ error: 'Administrator passcode not yet configured. Claim admin access first.' });
+      res.status(409).json({ error: 'Administrator password not configured yet.' });
       return;
     }
     const body = req.body as Record<string, unknown>;
     const passcode = typeof body.passcode === 'string' ? body.passcode.trim() : '';
     if (!passcode || !store.verifyAdminPasscode(passcode)) {
-      res.status(401).json({ error: 'Invalid administrator passcode.' });
+      adminLoginLimiter.recordFailure(limiterKey);
+      res.status(401).json({ error: 'Incorrect administrator password.' });
       return;
     }
+
+    adminLoginLimiter.clear(limiterKey);
     const session = issueAdminSession();
     res.json(session);
   });
 
-  app.post('/api/admin/logout', (req, res) => {
+  app.post('/api/admin/logout', requireLanAdminAccess, (req, res) => {
     const token = extractBearerToken(req);
     if (token) {
       adminSessions.delete(token);
@@ -188,51 +231,82 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
     res.json({ ok: true });
   });
 
-  // Protected Device Management & Pairing Code Endpoints
-  app.post('/api/pairing/generate', requireAdmin, (req, res) => {
-    const body = req.body as Record<string, unknown>;
+  // Protected QR Pairing & Device Registry Endpoints
+  app.post('/api/pairing/generate', requireLanAdminAccess, requireAdmin, (req, res) => {
+    const body = (req.body || {}) as Record<string, unknown>;
     const ttl =
       typeof body.ttl_seconds === 'number' && Number.isFinite(body.ttl_seconds)
         ? body.ttl_seconds
-        : undefined;
+        : 120;
     const platformHint =
       body.platform_hint === 'android' || body.platform_hint === 'windows' || body.platform_hint === 'any'
         ? body.platform_hint
         : 'any';
 
     const generated = store.generatePairingCode(ttl, platformHint);
+    const lanAddresses = getLanIPv4Addresses();
+    const settings = store.getSettings();
+    const requestedServerUrl =
+      typeof body.server_url === 'string' && /^https?:\/\/[^/\s]+/i.test(body.server_url.trim())
+        ? body.server_url.trim().replace(/\/+$/, '')
+        : lanAddresses.length > 0
+          ? `http://${lanAddresses[0]}:${settings.server_port}`
+          : '';
+
+    const qrPayload = requestedServerUrl
+      ? `netfusion://pair?server=${encodeURIComponent(requestedServerUrl)}&pairing_id=${encodeURIComponent(generated.pairing_id)}&secret=${encodeURIComponent(generated.secret)}`
+      : '';
+
     res.status(201).json({
       ...generated,
       platform_hint: platformHint,
-      lan_addresses: getLanIPv4Addresses(),
+      lan_addresses: lanAddresses,
+      qr_payload: qrPayload,
     });
   });
 
-  app.get('/api/pairing/status', requireAdmin, (_req, res) => {
+  app.get('/api/pairing/status', requireLanAdminAccess, requireAdmin, (_req, res) => {
     res.json(store.getPairingStatus());
   });
 
-  app.get('/api/clients', requireAdmin, (_req, res) => {
+  app.get('/api/clients', requireLanAdminAccess, requireAdmin, (_req, res) => {
     res.json({
       clients: store.getClients(),
       heartbeat_timeout_seconds: store.getSettings().heartbeat_timeout_seconds,
     });
   });
 
-  app.delete('/api/clients/:id', requireAdmin, (req, res) => {
+  app.delete('/api/clients/:id', requireLanAdminAccess, requireAdmin, (req, res) => {
     const ok = store.revokeClient(req.params.id);
     if (!ok) {
-      res.status(404).json({ error: 'Client not found' });
+      res.status(404).json({ error: 'Device not found' });
       return;
     }
     monitor.notifyDeviceChange();
     res.json({ clients: store.getClients() });
   });
 
-  // Client Registration & Heartbeat Endpoints (LAN Android / Windows Clients)
+  // Client Registration & Heartbeat Endpoints (Rate-limited against guessing)
   app.post('/api/clients/pair', (req, res) => {
-    const body = req.body as Record<string, unknown>;
-    const pairingCode = typeof body.pairing_code === 'string' ? body.pairing_code.trim() : '';
+    const limiterKey = extractRemoteSocketIp(req);
+    const rate = pairLimiter.isBlocked(limiterKey);
+    if (rate.blocked) {
+      res.setHeader('Retry-After', String(rate.retryAfterSeconds));
+      res.status(429).json({
+        error: `Too many failed pairing attempts. Try again in ${rate.retryAfterSeconds} seconds.`,
+        reason: 'rate_limited',
+      });
+      return;
+    }
+
+    const body = (req.body || {}) as Record<string, unknown>;
+    const pairingId = typeof body.pairing_id === 'string' ? body.pairing_id.trim() : undefined;
+    const rawSecret =
+      typeof body.secret === 'string' && body.secret.trim()
+        ? body.secret.trim()
+        : typeof body.pairing_code === 'string'
+          ? body.pairing_code.trim()
+          : '';
     const deviceName = typeof body.device_name === 'string' ? body.device_name.trim() : '';
     const platform: DevicePlatform | null =
       body.platform === 'android' || body.platform === 'windows' ? body.platform : null;
@@ -246,8 +320,12 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
         : '1.0.0';
     const ipAddress = normalizeClientIp(req, body.ip_address);
 
-    if (!pairingCode) {
-      res.status(401).json({ error: 'A valid temporary pairing code is required to register a device.' });
+    if (!rawSecret) {
+      pairLimiter.recordFailure(limiterKey);
+      res.status(401).json({
+        error: 'A valid single-use pairing QR code or secret is required.',
+        reason: 'invalid',
+      });
       return;
     }
     if (!deviceName || deviceName.length > 64 || !platform) {
@@ -256,7 +334,8 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
     }
 
     const result = store.pairDeviceWithCode({
-      pairing_code: pairingCode,
+      pairing_id: pairingId,
+      pairing_code: rawSecret,
       device_name: deviceName,
       platform,
       device_model: deviceModel,
@@ -265,16 +344,18 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
     });
 
     if (!result.ok) {
+      pairLimiter.recordFailure(limiterKey);
       const messages: Record<typeof result.reason, string> = {
-        invalid: 'Invalid pairing code.',
-        expired: 'Pairing code has expired. Generate a new code on the NetFusion server.',
-        used: 'Pairing code has already been used.',
+        invalid: 'Invalid QR code or pairing secret.',
+        expired: 'Pairing QR code has expired. Generate a new code on the NetFusion dashboard.',
+        used: 'This pairing QR code has already been used.',
         platform_mismatch: 'Pairing code is restricted to a different device platform.',
       };
       res.status(401).json({ error: messages[result.reason], reason: result.reason });
       return;
     }
 
+    pairLimiter.clear(limiterKey);
     monitor.notifyDeviceChange();
     res.status(201).json({
       device: result.device,
@@ -294,6 +375,9 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
     }
 
     const body = (req.body || {}) as Record<string, unknown>;
+    const toNonNegNumberOrUndefined = (val: unknown): number | undefined =>
+      typeof val === 'number' && Number.isFinite(val) && val >= 0 ? val : undefined;
+
     const updated = store.recordDeviceHeartbeat(token, {
       ip_address:
         typeof body.ip_address === 'string' && body.ip_address.trim()
@@ -307,6 +391,10 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
         typeof body.device_model === 'string' && body.device_model.trim()
           ? body.device_model.trim().slice(0, 64)
           : undefined,
+      rx_bytes: toNonNegNumberOrUndefined(body.rx_bytes),
+      tx_bytes: toNonNegNumberOrUndefined(body.tx_bytes),
+      download_bps: toNonNegNumberOrUndefined(body.download_bps),
+      upload_bps: toNonNegNumberOrUndefined(body.upload_bps),
     });
 
     if (!updated) {
@@ -322,72 +410,23 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
     });
   });
 
-  // Network Interfaces & Telemetry Endpoints
+  // Real Host Network Interfaces & Internet Check Endpoints
   app.get('/api/interfaces', (_req, res) => {
     const snapshot = monitor.getSnapshot();
     res.json({ interfaces: snapshot.interfaces, timestamp: snapshot.timestamp });
   });
 
-  app.put('/api/interfaces/:id', async (req, res) => {
-    const { id } = req.params;
-    const existing = store.getInterfaceById(id);
-    if (!existing) {
-      res.status(404).json({ error: 'Interface not found' });
-      return;
-    }
-
-    const body = req.body as Record<string, unknown>;
-    const patch: Parameters<typeof store.updateInterface>[1] = {};
-
-    if (typeof body.enabled === 'boolean') {
-      patch.enabled = body.enabled ? 1 : 0;
-      store.addSystemEvent(
-        'info',
-        'interface',
-        `${existing.display_name} ${body.enabled ? 'enabled' : 'disabled'} by operator.`,
-      );
-    }
-    if (typeof body.simulated_down === 'boolean') {
-      patch.simulated_down = body.simulated_down ? 1 : 0;
-      store.addSystemEvent(
-        body.simulated_down ? 'warning' : 'info',
-        'failover',
-        body.simulated_down
-          ? `Simulated disconnect triggered on ${existing.display_name}.`
-          : `Cleared simulated disconnect on ${existing.display_name}.`,
-      );
-    }
-    if (typeof body.weight === 'number' && Number.isFinite(body.weight)) {
-      patch.weight = Math.max(5, Math.min(100, Math.round(body.weight)));
-    }
-    if (typeof body.priority_order === 'number' && Number.isFinite(body.priority_order)) {
-      patch.priority_order = Math.max(1, Math.min(50, Math.round(body.priority_order)));
-    }
-
-    store.updateInterface(id, patch);
-    const snapshot = await monitor.runCycle();
-    res.json({ snapshot });
-  });
-
-  app.post('/api/interfaces/:id/probe', async (req, res) => {
-    const { id } = req.params;
-    const existing = store.getInterfaceById(id);
-    if (!existing) {
-      res.status(404).json({ error: 'Interface not found' });
-      return;
-    }
-
+  app.post('/api/network/check', async (_req, res) => {
     const cloudflareMs = await monitor.probeHostTcp('1.1.1.1', 443);
     const googleMs = await monitor.probeHostTcp('8.8.8.8', 443);
     store.addSystemEvent(
-      'info',
-      'probe',
-      `Live probe on ${existing.display_name}: 1.1.1.1=${cloudflareMs ?? 'timeout'}ms, 8.8.8.8=${googleMs ?? 'timeout'}ms.`,
+      cloudflareMs !== null || googleMs !== null ? 'info' : 'warning',
+      'network',
+      `Internet check: 1.1.1.1=${cloudflareMs !== null ? `${cloudflareMs}ms` : 'unreachable'}, 8.8.8.8=${googleMs !== null ? `${googleMs}ms` : 'unreachable'}.`,
     );
     const snapshot = await monitor.runCycle();
     res.json({
       probe: {
-        interface_id: id,
         cloudflare_ms: cloudflareMs,
         google_dns_ms: googleMs,
       },
@@ -424,136 +463,12 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
     });
   });
 
-  app.get('/api/streaming/profiles', (_req, res) => {
-    res.json({ profiles: store.getStreamingProfiles() });
-  });
-
-  app.put('/api/streaming/profile', (req, res) => {
-    const body = req.body as Record<string, unknown>;
-    const profileId = typeof body.profile_id === 'string' ? body.profile_id.trim() : '';
-    if (!profileId) {
-      res.status(400).json({ error: 'profile_id is required' });
-      return;
-    }
-    try {
-      const profiles = store.activateStreamingProfile(profileId);
-      res.json({ profiles });
-    } catch {
-      res.status(404).json({ error: 'Streaming profile not found' });
-    }
-  });
-
-  app.get('/api/qos/policies', (_req, res) => {
-    res.json({
-      rules: store.getQosRules(),
-      tiers: [
-        { tier: 'P0', label: 'Real-time', weight: 100, description: 'Video calls and interactive audio' },
-        { tier: 'P1', label: 'Gaming', weight: 90, description: 'Online and cloud gaming' },
-        { tier: 'P2', label: 'Video', weight: 70, description: 'YouTube, OTT, and live video playback' },
-        { tier: 'P3', label: 'Normal', weight: 50, description: 'Web browsing and general apps' },
-        { tier: 'P4', label: 'Background', weight: 30, description: 'Bulk downloads and OS updates' },
-      ],
-    });
-  });
-
-  app.put('/api/qos/policies', (req, res) => {
-    const body = req.body as Record<string, unknown>;
-    const id = typeof body.id === 'string' ? body.id : '';
-    const enabled = typeof body.enabled === 'boolean' ? body.enabled : null;
-    if (!id || enabled === null) {
-      res.status(400).json({ error: 'Rule id and enabled boolean are required' });
-      return;
-    }
-    const updated = store.toggleQosRule(id, enabled);
-    if (!updated) {
-      res.status(404).json({ error: 'QoS rule not found' });
-      return;
-    }
-    res.json({ rules: store.getQosRules() });
-  });
-
-  app.post('/api/qos/rules', (req, res) => {
-    const body = req.body as Record<string, unknown>;
-    const appName = typeof body.app_name === 'string' ? body.app_name.trim() : '';
-    const matchPattern = typeof body.match_pattern === 'string' ? body.match_pattern.trim() : '';
-    const tier = body.tier as QosRuleRecord['tier'];
-    const preferred =
-      typeof body.preferred_interface_id === 'string' && body.preferred_interface_id.trim()
-        ? body.preferred_interface_id.trim()
-        : null;
-
-    if (!appName || !matchPattern || !['P0', 'P1', 'P2', 'P3', 'P4'].includes(tier)) {
-      res.status(400).json({ error: 'Invalid QoS rule payload' });
-      return;
-    }
-    store.createQosRule({
-      app_name: appName.slice(0, 64),
-      match_pattern: matchPattern.slice(0, 80),
-      tier,
-      preferred_interface_id: preferred,
-    });
-    res.status(201).json({ rules: store.getQosRules() });
-  });
-
-  app.delete('/api/qos/rules/:id', (req, res) => {
-    const ok = store.deleteQosRule(req.params.id);
-    if (!ok) {
-      res.status(404).json({ error: 'QoS rule not found' });
-      return;
-    }
-    res.json({ rules: store.getQosRules() });
-  });
-
-  app.get('/api/bonding/status', (_req, res) => {
-    const snapshot = monitor.getSnapshot();
-    const healthyCount = snapshot.interfaces.filter(
-      (i) => i.enabled && !i.simulated_down && i.status !== 'offline',
-    ).length;
-
-    res.json({
-      enabled: false,
-      relay_mode: 'optional',
-      relay_connected: false,
-      active_tunnels: 0,
-      candidate_paths: healthyCount,
-      capabilities: {
-        network_monitoring: true,
-        load_balancing: true,
-        failover: true,
-        streaming_prioritization: true,
-        single_flow_aggregation: false,
-        combined_public_exit: false,
-      },
-      explanation:
-        'True single-flow bandwidth bonding is disabled in NetFusion v0.1 and requires an optional remote QUIC relay. Separate sessions currently load-balance independently across healthy interfaces.',
-    });
-  });
-
-  app.get('/api/bonding/paths', (_req, res) => {
-    const snapshot = monitor.getSnapshot();
-    const paths = snapshot.interfaces.map((iface) => ({
-      interface_id: iface.id,
-      display_name: iface.display_name,
-      provider: iface.provider,
-      tunnel_state: 'standby_no_relay',
-      ready_for_quic: Boolean(iface.enabled && !iface.simulated_down && iface.status !== 'offline'),
-      latency_ms: iface.latest_metric?.latency_ms ?? 0,
-      jitter_ms: iface.latest_metric?.jitter_ms ?? 0,
-      packet_loss_pct: iface.latest_metric?.packet_loss_pct ?? 0,
-    }));
-    res.json({ paths });
-  });
-
-  app.get('/api/stats/usage', (_req, res) => {
-    res.json({ usage: store.getUsageStats() });
-  });
-
-  app.get('/api/settings', (_req, res) => {
+  app.get('/api/settings', requireLanAdminAccess, (_req, res) => {
     res.json({ settings: store.getSettings() });
   });
 
-  app.put('/api/settings', (req, res) => {
-    const body = req.body as Record<string, unknown>;
+  app.put('/api/settings', requireLanAdminAccess, (req, res) => {
+    const body = (req.body || {}) as Record<string, unknown>;
     const patch: Partial<NetFusionSettings> = {};
 
     if (body.theme === 'light' || body.theme === 'dark' || body.theme === 'system') {
@@ -565,19 +480,6 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
     if (typeof body.auto_discovery === 'boolean') {
       patch.auto_discovery = body.auto_discovery;
     }
-    if (typeof body.automatic_failover === 'boolean') {
-      patch.automatic_failover = body.automatic_failover;
-    }
-    if (typeof body.load_balancing_enabled === 'boolean') {
-      patch.load_balancing_enabled = body.load_balancing_enabled;
-    }
-    if (
-      body.load_balancing_algorithm === 'weighted_health' ||
-      body.load_balancing_algorithm === 'lowest_latency' ||
-      body.load_balancing_algorithm === 'round_robin'
-    ) {
-      patch.load_balancing_algorithm = body.load_balancing_algorithm;
-    }
     if (typeof body.monitor_interval_seconds === 'number' && Number.isFinite(body.monitor_interval_seconds)) {
       patch.monitor_interval_seconds = Math.max(1, Math.min(30, Math.round(body.monitor_interval_seconds)));
     }
@@ -585,7 +487,7 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
       patch.heartbeat_timeout_seconds = Math.max(5, Math.min(300, Math.round(body.heartbeat_timeout_seconds)));
     }
     if (typeof body.pairing_code_ttl_seconds === 'number' && Number.isFinite(body.pairing_code_ttl_seconds)) {
-      patch.pairing_code_ttl_seconds = Math.max(30, Math.min(900, Math.round(body.pairing_code_ttl_seconds)));
+      patch.pairing_code_ttl_seconds = Math.max(30, Math.min(600, Math.round(body.pairing_code_ttl_seconds)));
     }
     if (typeof body.server_port === 'number' && Number.isFinite(body.server_port)) {
       patch.server_port = Math.max(1024, Math.min(65535, Math.round(body.server_port)));
@@ -595,55 +497,12 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
     if (patch.monitor_interval_seconds !== undefined) {
       monitor.reschedule();
     }
-    store.addSystemEvent('info', 'settings', 'Updated NetFusion server configuration.');
+    store.addSystemEvent('info', 'settings', 'Updated NetFusion configuration.');
     res.json({ settings: updated });
-  });
-
-  app.post('/api/gateway/mode', (req, res) => {
-    const body = req.body as Record<string, unknown>;
-    if (typeof body.gateway_mode !== 'boolean') {
-      res.status(400).json({ error: 'gateway_mode boolean is required' });
-      return;
-    }
-    const updated = store.updateSettings({ gateway_mode: body.gateway_mode });
-    store.addSystemEvent(
-      body.gateway_mode ? 'warning' : 'info',
-      'gateway',
-      body.gateway_mode
-        ? 'Activated Gateway Routing Mode for paired LAN clients.'
-        : 'Returned to safe Monitoring Mode (no system route changes).',
-    );
-    res.json({ settings: updated, snapshot: monitor.getSnapshot() });
   });
 
   app.get('/api/system-events', (_req, res) => {
     res.json({ events: store.getSystemEvents(60) });
-  });
-
-  app.get('/api/repo/files', (_req, res) => {
-    const available = REPO_ALLOWLIST_FILES.filter((rel) => {
-      const resolved = path.resolve(WORKSPACE_ROOT, rel);
-      return (
-        (resolved === WORKSPACE_ROOT || resolved.startsWith(WORKSPACE_ROOT + path.sep)) &&
-        fs.existsSync(resolved)
-      );
-    });
-    res.json({ files: available });
-  });
-
-  app.get('/api/repo/file', (req, res) => {
-    const rel = typeof req.query.path === 'string' ? req.query.path : '';
-    if (!REPO_ALLOWLIST_FILES.includes(rel)) {
-      res.status(403).json({ error: 'File is not in allowlisted repository source list' });
-      return;
-    }
-    const resolved = path.resolve(WORKSPACE_ROOT, rel);
-    if (!resolved.startsWith(WORKSPACE_ROOT + path.sep) || !fs.existsSync(resolved)) {
-      res.status(404).json({ error: 'File not found' });
-      return;
-    }
-    const content = fs.readFileSync(resolved, 'utf8');
-    res.json({ path: rel, content });
   });
 
   return {
@@ -651,6 +510,7 @@ export function createNetFusionApp(options?: { dbPath?: string; startMonitor?: b
     store,
     monitor,
     close: () => {
+      monitor.stop();
       store.db.close();
     },
   };
